@@ -184,3 +184,15 @@ fn pipeline_preserves_unsimulable_reason_diagnostics() {
         report.unsimulable_reasons
     );
 }
+
+#[test]
+fn pipeline_explains_missing_start_token_price() {
+    let edges = synthetic_detectable_edges();
+    let report = run_sample(&edges, &HashMap::new(), None, &test_params());
+
+    assert_eq!(report.rejected_unsimulable, 1);
+    assert_eq!(
+        report.unsimulable_reasons.get("no USD price for start token"),
+        Some(&1)
+    );
+}

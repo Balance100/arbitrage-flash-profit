@@ -244,6 +244,10 @@ pub fn run_sample(
         // No USD price for the start token => can't size a loan => unsimulable.
         let Some(price) = start_token_usd(usd_prices, first.token_in) else {
             report.rejected_unsimulable += 1;
+            *report
+                .unsimulable_reasons
+                .entry("no USD price for start token".to_string())
+                .or_insert(0) += 1;
             continue;
         };
 
