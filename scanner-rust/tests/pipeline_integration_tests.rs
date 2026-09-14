@@ -158,3 +158,29 @@ fn all_negative_snapshot_yields_zero_survivors() {
     assert!(report.block.is_none());
     assert_eq!(report.edges_loaded, 2);
 }
+
+#[test]
+fn pipeline_preserves_unsimulable_reason_diagnostics() {
+    let mut edges = synthetic_detectable_edges();
+    for edge in &mut edges {
+        edge.swap_state = None;
+    }
+
+    let mut usd_prices = HashMap::new();
+    for edge in &edges {
+        usd_prices.insert(edge.token_in, 1.0);
+        usd_prices.insert(edge.token_out, 1.0);
+    }
+
+    let report = run_sample(&edges, &usd_prices, None, &test_params());
+
+    assert_eq!(report.rejected_unsimulable, 1);
+    assert!(
+        report
+            .unsimulable_reasons
+            .keys()
+            .any(|reason| reason.contains("no on-chain swap state")),
+        "reason diagnostics should identify missing swap state: {:?}",
+        report.unsimulable_reasons
+    );
+}

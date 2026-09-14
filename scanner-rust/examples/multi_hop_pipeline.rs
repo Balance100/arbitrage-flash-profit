@@ -110,6 +110,14 @@ fn print_sample(idx: usize, r: &SampleReport) {
     for s in &r.survivors {
         print_survivor(s);
     }
+    if !r.unsimulable_reasons.is_empty() {
+        let mut reasons: Vec<(&String, &usize)> = r.unsimulable_reasons.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        println!("    unsimulable reasons:");
+        for (reason, count) in reasons {
+            println!("      {count}x {reason}");
+        }
+    }
 }
 
 async fn live_pass(params: &PipelineParams) -> eyre::Result<()> {
@@ -151,6 +159,12 @@ async fn live_pass(params: &PipelineParams) -> eyre::Result<()> {
     let total_survived: usize = reports.iter().map(|r| r.survived).sum();
     let total_neg: usize = reports.iter().map(|r| r.rejected_negative).sum();
     let total_unsim: usize = reports.iter().map(|r| r.rejected_unsimulable).sum();
+    let mut unsim_reasons = std::collections::HashMap::<String, usize>::new();
+    for report in &reports {
+        for (reason, count) in &report.unsimulable_reasons {
+            *unsim_reasons.entry(reason.clone()).or_insert(0) += count;
+        }
+    }
     println!(
         "LIVE AGGREGATE over {} successful sample(s): cycles_proposed={} | survived={} \
          rejected_negative={} rejected_unsimulable={}",
@@ -160,6 +174,14 @@ async fn live_pass(params: &PipelineParams) -> eyre::Result<()> {
         total_neg,
         total_unsim
     );
+    if !unsim_reasons.is_empty() {
+        let mut reasons: Vec<(&String, &usize)> = unsim_reasons.iter().collect();
+        reasons.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        println!("LIVE UNSIMULABLE REASONS:");
+        for (reason, count) in reasons {
+            println!("  {count}x {reason}");
+        }
+    }
     if total_survived == 0 {
         println!(
             "LIVE RESULT: ZERO survivors across all sampled blocks. Every spot cycle collapsed once \
