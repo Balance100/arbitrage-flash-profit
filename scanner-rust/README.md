@@ -67,8 +67,8 @@ live pools @ block N            (pools.rs, Phase 3 + Phase 8 cross-tick data)
 
 `pipeline::run_sample` runs steps 2–6 over one snapshot and returns honest
 per-stage metrics (edges loaded, USD-priceable coverage, cycles proposed,
-survived, rejected_negative, rejected_unsimulable, and each survivor's route +
-realized net + encoded calldata).
+survived, rejected_negative, rejected_unsimulable, counted unsimulable rejection
+reasons, and each survivor's route + realized net + encoded calldata).
 
 ### V3 cross-tick swap simulation (Phase 8)
 The V3 leg of the sim gate walks each swap **tick-by-tick**, exactly like the

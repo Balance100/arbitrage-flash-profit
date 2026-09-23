@@ -27,7 +27,8 @@ build ONLY — it never signs or broadcasts (execution stays disabled):
 6. ABI-encode the `executeArbitrage` calldata (`flashlight.rs`) and STOP.
 
 `pipeline.rs::run_sample` performs steps 2–6 over one already-fetched snapshot and
-returns honest per-stage metrics. The capstone example
+returns honest per-stage metrics, including counted fail-closed reasons for
+every unsimulable cycle. The capstone example
 `examples/multi_hop_pipeline.rs` samples this across several live blocks plus an
 always-on synthetic fixture; `tests/pipeline_integration_tests.rs` exercises it
 deterministically with no RPC. See `README.md` for run commands.
@@ -67,4 +68,3 @@ quoting only within the current tick-spacing interval:
 6. Simulate active opportunities.
 7. Submit execution bundles.
 8. Emit metrics and telemetry.
-

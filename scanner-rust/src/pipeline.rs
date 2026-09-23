@@ -128,6 +128,9 @@ pub struct SampleReport {
     /// Cycles rejected as unsimulable (no start price, missing state, V3 tick
     /// boundary crossed, overflow, or payload build/validate failure).
     pub rejected_unsimulable: usize,
+    /// Exact fail-closed reason for each unsimulable cycle, keyed by the
+    /// simulator/payload diagnostic and counted across proposed cycles.
+    pub unsimulable_reasons: HashMap<String, usize>,
     /// Full DRY-RUN report for each survivor.
     pub survivors: Vec<SurvivorReport>,
 }
@@ -241,6 +244,10 @@ pub fn run_sample(
         // No USD price for the start token => can't size a loan => unsimulable.
         let Some(price) = start_token_usd(usd_prices, first.token_in) else {
             report.rejected_unsimulable += 1;
+            *report
+                .unsimulable_reasons
+                .entry("no USD price for start token".to_string())
+                .or_insert(0) += 1;
             continue;
         };
 
@@ -257,12 +264,24 @@ pub fn run_sample(
                 }
                 // Survived the sim but the payload couldn't be built/validated
                 // (e.g. hop count out of [2,5]); fail-closed as unsimulable.
-                None => report.rejected_unsimulable += 1,
+                None => {
+                    report.rejected_unsimulable += 1;
+                    *report
+                        .unsimulable_reasons
+                        .entry("payload build or validation failed".to_string())
+                        .or_insert(0) += 1;
+                }
             }
         } else if best.outcome.simulable {
             report.rejected_negative += 1;
         } else {
             report.rejected_unsimulable += 1;
+            let reason = best
+                .outcome
+                .reject_reason
+                .clone()
+                .unwrap_or_else(|| "unknown simulation rejection".to_string());
+            *report.unsimulable_reasons.entry(reason).or_insert(0) += 1;
         }
     }
 
