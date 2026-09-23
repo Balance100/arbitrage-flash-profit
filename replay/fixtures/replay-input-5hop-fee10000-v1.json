@@ -1,0 +1,85 @@
+{
+  "fixtureVersion": "replay-input-5hop-fee10000-v1",
+  "description": "SYNTHETIC, read-only fixture for the deterministic replay boundary. A 5-hop closed loop (asset -> tokenB -> tokenC -> tokenD -> tokenE -> asset) at the contract's MAX_HOPS upper bound, using a uniform high V2 fee tier (100 bps / 1.00%, feePpm=10000) to complete fee-tier coverage (5/30/100 bps) across the matrix. Uses a UNIFORM fee (not mixed per-hop) because a per-hop-varying-fee route compounds enough independent float-vs-U256 rounding steps to exceed the shadow comparison's documented 1e-6/1e-4 tolerances (see replay/README.md); a uniform fee keeps the TS float estimate and the Rust U256 source of truth within tolerance while still covering this fee tier and this route length. NOT live data. NOT production evidence.",
+  "network": "fixture",
+  "edges": [
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000061",
+      "tokenOut": "0x0000000000000000000000000000000000000062",
+      "router": "0x000000000000000000000000000000000000006b",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 10000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    },
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000062",
+      "tokenOut": "0x0000000000000000000000000000000000000063",
+      "router": "0x000000000000000000000000000000000000006c",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 10000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    },
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000063",
+      "tokenOut": "0x0000000000000000000000000000000000000064",
+      "router": "0x000000000000000000000000000000000000006d",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 10000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    },
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000064",
+      "tokenOut": "0x0000000000000000000000000000000000000065",
+      "router": "0x000000000000000000000000000000000000006e",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 10000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    },
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000065",
+      "tokenOut": "0x0000000000000000000000000000000000000061",
+      "router": "0x000000000000000000000000000000000000006f",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 10000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    }
+  ],
+  "usdPrices": {
+    "0x0000000000000000000000000000000000000061": 1.0,
+    "0x0000000000000000000000000000000000000062": 1.0,
+    "0x0000000000000000000000000000000000000063": 1.0,
+    "0x0000000000000000000000000000000000000064": 1.0,
+    "0x0000000000000000000000000000000000000065": 1.0
+  },
+  "pipelineParams": {
+    "aaveBps": 5.0,
+    "loanSizesUsd": [1000.0, 5000.0],
+    "gasUsdPerHop": 4.0,
+    "slippageBps": 50
+  }
+}

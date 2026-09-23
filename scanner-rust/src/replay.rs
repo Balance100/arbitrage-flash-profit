@@ -89,11 +89,11 @@ fn parse_u256(dec_str: &str) -> U256 {
         .unwrap_or_else(|e| panic!("replay fixture: invalid integer {dec_str}: {e}"))
 }
 
-fn fixture_path(repo_root: &Path) -> PathBuf {
-    repo_root
-        .join("replay")
-        .join("fixtures")
-        .join("replay-input-v1.json")
+/// Default (baseline) fixture, relative to the repo root.
+pub const DEFAULT_FIXTURE_REL_PATH: &str = "replay/fixtures/replay-input-v1.json";
+
+fn fixture_path(repo_root: &Path, fixture_rel_path: &str) -> PathBuf {
+    repo_root.join(fixture_rel_path)
 }
 
 /// Resolve the workspace root from `CARGO_MANIFEST_DIR` (the `scanner-rust`
@@ -223,13 +223,15 @@ pub struct ReplayEnvelope {
     pub result: PipelineEvidence,
 }
 
-/// Run the whole Rust side of the replay boundary: read the shared fixture,
-/// build its pool edges, run the EXISTING `pipeline::run_sample` engine, and
-/// return the `scanner-evidence-v1` envelope. `repo_root` is the workspace root
-/// (use [`default_repo_root`] for the normal CLI/example entrypoint; tests pass
-/// an explicit path so they never depend on `CARGO_MANIFEST_DIR`).
-pub fn run_rust_adapter(repo_root: &Path) -> ReplayEnvelope {
-    let path = fixture_path(repo_root);
+/// Run the whole Rust side of the replay boundary over an arbitrary fixture:
+/// read the fixture, build its pool edges, run the EXISTING
+/// `pipeline::run_sample` engine, and return the `scanner-evidence-v1`
+/// envelope. `repo_root` is the workspace root (use [`default_repo_root`] for
+/// the normal CLI/example entrypoint). `fixture_rel_path` is relative to
+/// `repo_root`, e.g. [`DEFAULT_FIXTURE_REL_PATH`] or one of the additional
+/// route-length/fee-tier fixtures under `replay/fixtures/`.
+pub fn run_rust_adapter_with_fixture(repo_root: &Path, fixture_rel_path: &str) -> ReplayEnvelope {
+    let path = fixture_path(repo_root, fixture_rel_path);
     let raw = std::fs::read(&path)
         .unwrap_or_else(|e| panic!("replay fixture not found at {}: {e}", path.display()));
     let source_hash = sha256_hex(&raw);
@@ -258,13 +260,20 @@ pub fn run_rust_adapter(repo_root: &Path) -> ReplayEnvelope {
         input_hash,
         source_hash,
         adapter: "rust".to_string(),
-        fixture_path: "replay/fixtures/replay-input-v1.json".to_string(),
+        fixture_path: fixture_rel_path.replace('\\', "/"),
         fixture_version: fixture.fixture_version,
         generated_at: chrono::Utc::now().to_rfc3339(),
         read_only: true,
         disclaimer: "SYNTHETIC REPLAY EVIDENCE — deterministic fixture replay only. NOT live data, NOT production evidence, NOTHING signed or broadcast.".to_string(),
         result: PipelineEvidence::from(&report),
     }
+}
+
+/// Baseline single-fixture entrypoint, preserved for backward compatibility
+/// with existing callers/tests. Equivalent to
+/// `run_rust_adapter_with_fixture(repo_root, DEFAULT_FIXTURE_REL_PATH)`.
+pub fn run_rust_adapter(repo_root: &Path) -> ReplayEnvelope {
+    run_rust_adapter_with_fixture(repo_root, DEFAULT_FIXTURE_REL_PATH)
 }
 
 #[cfg(test)]
@@ -305,5 +314,45 @@ mod tests {
         assert_eq!(a.result.survivors.len(), 1);
         assert!(a.result.survivors[0].realized_net_usd > 0.0);
         assert_eq!(a.result.survivors[0].hops, 3);
+    }
+
+    /// Route-length/fee-tier matrix: each fixture must be a genuine (detected
+    /// AND sim-positive) survivor with the expected hop count, deterministic
+    /// across repeated runs, exercising the SAME `pipeline::run_sample` engine
+    /// as the baseline fixture — no reimplemented math, no faked V3/cross-tick
+    /// behavior (all matrix fixtures are plain V2 constant-product hops).
+    fn assert_fixture_is_a_genuine_survivor(fixture_rel_path: &str, expected_hops: usize) {
+        let repo_root = default_repo_root();
+        let a = run_rust_adapter_with_fixture(&repo_root, fixture_rel_path);
+        let b = run_rust_adapter_with_fixture(&repo_root, fixture_rel_path);
+
+        assert_eq!(a.run_id, b.run_id, "runId must be deterministic across runs");
+        assert_eq!(a.source_hash, b.source_hash);
+        assert_eq!(a.input_hash, a.source_hash);
+        assert_eq!(a.fixture_path, fixture_rel_path);
+
+        assert_eq!(a.result.edges_loaded, expected_hops);
+        assert!(a.result.cycles_proposed >= 1);
+        assert_eq!(a.result.survived, 1, "fixture must be a genuine survivor, not a mirage or a reject");
+        assert_eq!(a.result.rejected_negative, 0);
+        assert_eq!(a.result.survivors.len(), 1);
+        assert_eq!(a.result.survivors[0].hops, expected_hops);
+        assert!(a.result.survivors[0].realized_ratio > 1.0);
+        assert!(a.result.survivors[0].realized_net_usd > 0.0);
+    }
+
+    #[test]
+    fn two_hop_low_fee_fixture_is_a_genuine_survivor() {
+        assert_fixture_is_a_genuine_survivor("replay/fixtures/replay-input-2hop-fee500-v1.json", 2);
+    }
+
+    #[test]
+    fn four_hop_standard_fee_fixture_is_a_genuine_survivor() {
+        assert_fixture_is_a_genuine_survivor("replay/fixtures/replay-input-4hop-fee3000-v1.json", 4);
+    }
+
+    #[test]
+    fn five_hop_high_fee_fixture_is_a_genuine_survivor() {
+        assert_fixture_is_a_genuine_survivor("replay/fixtures/replay-input-5hop-fee10000-v1.json", 5);
     }
 }

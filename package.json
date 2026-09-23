@@ -12,6 +12,7 @@
     "replay:rs": "cargo run --manifest-path scanner-rust/Cargo.toml --example replay_adapter",
     "replay:manifest": "node scripts/replay/manifest.mjs",
     "replay:all": "npm run replay:ts && npm run replay:rs && npm run replay:manifest",
+    "replay:matrix": "node scripts/replay/matrix.mjs",
     "replay:test": "playwright test tests/replay-boundary.spec.ts",
     "lint": "eslint .",
     "preview": "vite preview",

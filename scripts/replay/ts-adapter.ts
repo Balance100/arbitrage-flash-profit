@@ -126,8 +126,14 @@ function applySlippageBps(amount: number, slippageBps: number): number {
   return (amount * (10_000 - slippageBps)) / 10_000;
 }
 
-export function runTsAdapter() {
-  const raw = readFileSync(FIXTURE_PATH);
+/** Run the TS adapter over an arbitrary fixture file (defaults to the
+ * baseline `FIXTURE_PATH`). Used both by the default single-fixture CLI/tests
+ * and by the fixture-matrix runner (`scripts/replay/matrix.mjs`) to exercise
+ * the SAME adapter logic over the small, focused route-length/fee-tier
+ * fixture matrix under `replay/fixtures/`.
+ */
+export function runTsAdapter(fixturePath: string = FIXTURE_PATH) {
+  const raw = readFileSync(fixturePath);
   const sourceHash = sha256Hex(raw);
   // The fixture is read and consumed verbatim (no pre-processing before use),
   // so inputHash == sourceHash by construction. Kept as a distinct envelope
@@ -257,7 +263,7 @@ export function runTsAdapter() {
     inputHash,
     sourceHash,
     adapter: 'ts' as const,
-    fixturePath: path.relative(REPO_ROOT, FIXTURE_PATH).replace(/\\/g, '/'),
+    fixturePath: path.relative(REPO_ROOT, fixturePath).replace(/\\/g, '/'),
     fixtureVersion: fixture.fixtureVersion,
     generatedAt: new Date().toISOString(),
     readOnly: true,
@@ -277,11 +283,20 @@ export function runTsAdapter() {
   return envelope;
 }
 
+// Optional CLI args (both optional, positional): a fixture path relative to
+// the repo root, and an output envelope filename (written under
+// `replay/out/`). Omitting both preserves the original single-fixture
+// behavior exactly (`FIXTURE_PATH` / `ts-envelope.json`); the matrix runner
+// (`scripts/replay/matrix.mjs`) passes both explicitly per fixture.
 function main() {
-  const envelope = runTsAdapter();
+  const [fixtureArg, outNameArg] = process.argv.slice(2);
+  const fixturePath = fixtureArg ? path.resolve(REPO_ROOT, fixtureArg) : FIXTURE_PATH;
+  const envelopePath = outNameArg ? path.join(OUT_DIR, outNameArg) : ENVELOPE_PATH;
+
+  const envelope = runTsAdapter(fixturePath);
   mkdirSync(OUT_DIR, { recursive: true });
-  writeFileSync(ENVELOPE_PATH, `${JSON.stringify(envelope, null, 2)}\n`, 'utf8');
-  console.log(`[replay:ts] wrote ${path.relative(REPO_ROOT, ENVELOPE_PATH)}`);
+  writeFileSync(envelopePath, `${JSON.stringify(envelope, null, 2)}\n`, 'utf8');
+  console.log(`[replay:ts] wrote ${path.relative(REPO_ROOT, envelopePath)}`);
   console.log(`[replay:ts] runId=${envelope.runId} inputHash=${envelope.inputHash} sourceHash=${envelope.sourceHash}`);
   console.log(
     `[replay:ts] status=${envelope.result.opportunity.status} netProfitUsd=${envelope.result.trace.netProfitUsd.toFixed(4)}`,

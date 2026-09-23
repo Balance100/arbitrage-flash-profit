@@ -232,9 +232,19 @@ export function validatePairing(tsEnvelope, rsEnvelope) {
 }
 
 export function generateManifest() {
+  return generateManifestForPaths(TS_ENVELOPE_PATH, RS_ENVELOPE_PATH);
+}
+
+/** Generalized manifest generator: pairs an arbitrary TS/Rust envelope path
+ * pair (used by the default single-fixture CLI via `generateManifest()`, and
+ * by the fixture-matrix runner `scripts/replay/matrix.mjs` for each fixture
+ * in the route-length/fee-tier matrix). Pure w.r.t. its inputs beyond reading
+ * the two files; same fail-closed pairing + shadow-comparison logic either way.
+ */
+export function generateManifestForPaths(tsEnvelopePath, rsEnvelopePath) {
   const checks = [];
-  const ts = loadEnvelope(TS_ENVELOPE_PATH, checks);
-  const rs = loadEnvelope(RS_ENVELOPE_PATH, checks);
+  const ts = loadEnvelope(tsEnvelopePath, checks);
+  const rs = loadEnvelope(rsEnvelopePath, checks);
 
   const validation = validatePairing(ts?.envelope, rs?.envelope);
   const allChecks = [...checks, ...validation.checks];
@@ -256,11 +266,11 @@ export function generateManifest() {
       : null,
     artifacts: {
       tsEnvelope: {
-        path: path.relative(REPO_ROOT, TS_ENVELOPE_PATH).replace(/\\/g, '/'),
+        path: path.relative(REPO_ROOT, tsEnvelopePath).replace(/\\/g, '/'),
         sha256: ts?.bytesHash ?? null,
       },
       rsEnvelope: {
-        path: path.relative(REPO_ROOT, RS_ENVELOPE_PATH).replace(/\\/g, '/'),
+        path: path.relative(REPO_ROOT, rsEnvelopePath).replace(/\\/g, '/'),
         sha256: rs?.bytesHash ?? null,
       },
     },

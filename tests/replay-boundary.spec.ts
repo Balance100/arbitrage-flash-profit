@@ -7,6 +7,7 @@ import { expect, test } from '@playwright/test';
 
 import { sha256Hex, deriveRunId } from '../scripts/replay/lib/hash.mjs';
 import { validatePairing } from '../scripts/replay/manifest.mjs';
+import { FIXTURE_MATRIX, runMatrix } from '../scripts/replay/matrix.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..');
@@ -232,5 +233,57 @@ test.describe('replay boundary: end-to-end TS adapter run', () => {
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+test.describe('replay boundary: fixture matrix (route length + fee-tier coverage)', () => {
+  test('TS adapter produces a deterministic, genuinely profitable trace for every matrix fixture', () => {
+    const adapterUrl = pathToFileURL(path.join(REPO_ROOT, 'scripts/replay/ts-adapter.ts')).href;
+    for (const entry of FIXTURE_MATRIX) {
+      const script = `
+        const mod = await import('${adapterUrl}');
+        const fixturePath = ${JSON.stringify(path.join(REPO_ROOT, entry.fixture))};
+        const a = mod.runTsAdapter(fixturePath);
+        const b = mod.runTsAdapter(fixturePath);
+        console.log(JSON.stringify({
+          runIdsMatch: a.runId === b.runId,
+          inputHashEqualsSourceHash: a.inputHash === a.sourceHash,
+          hops: a.result.trace.hops,
+          netProfitUsd: a.result.trace.netProfitUsd,
+          realizedRatio: a.result.trace.realizedRatio,
+          status: a.result.opportunity.status,
+        }));
+      `;
+      const tmpDir = mkdtempSync(path.join(tmpdir(), 'replay-matrix-ts-'));
+      const scriptPath = path.join(tmpDir, 'run.mjs');
+      writeFileSync(scriptPath, script, 'utf8');
+      try {
+        const stdout = execFileSync('node', ['--experimental-strip-types', scriptPath], {
+          cwd: REPO_ROOT,
+          encoding: 'utf8',
+        });
+        const result = JSON.parse(stdout.trim().split('\n').pop());
+        expect(result.runIdsMatch, entry.label).toBe(true);
+        expect(result.inputHashEqualsSourceHash, entry.label).toBe(true);
+        expect(result.hops, entry.label).toBe(entry.expectedHops);
+        expect(result.realizedRatio, entry.label).toBeGreaterThan(1);
+        expect(result.netProfitUsd, entry.label).toBeGreaterThan(0);
+        expect(result.status, entry.label).toBe('active');
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test('full TS+Rust matrix run pairs cleanly for every fixture with matching hop counts', () => {
+    test.setTimeout(180_000); // first `cargo run` in the matrix may need to compile
+    const results = runMatrix();
+    expect(results).toHaveLength(FIXTURE_MATRIX.length);
+    for (const r of results) {
+      expect(r.hopsOk, `${r.label}: hop count`).toBe(true);
+      expect(r.manifest.pass, `${r.label}: ${JSON.stringify(r.manifest.checks.filter((c) => !c.ok))}`).toBe(true);
+      expect(r.manifest.comparison.economicsMatch, r.label).toBe(true);
+    }
+    expect(results.every((r) => r.pass)).toBe(true);
   });
 });
