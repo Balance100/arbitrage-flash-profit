@@ -80,7 +80,21 @@ export function runMatrix() {
 }
 
 function main() {
-  const results = runMatrix();
+  let results;
+  try {
+    results = runMatrix();
+  } catch (error) {
+    // FAIL-CLOSED: an adapter or manifest process failure is also a failed
+    // matrix run. Remove any stale PASSING manifest before returning so a
+    // prior successful run can never mask an incomplete evaluation.
+    if (existsSync(MATRIX_MANIFEST_PATH)) {
+      rmSync(MATRIX_MANIFEST_PATH);
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    console.error(`[replay:matrix] FAIL-CLOSED: matrix execution failed. No matrix manifest written: ${message}`);
+    process.exitCode = 1;
+    return;
+  }
   const overallPass = results.every((r) => r.pass);
 
   const matrixManifest = {
