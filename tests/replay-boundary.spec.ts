@@ -25,8 +25,12 @@ function baseEnvelope(adapter) {
     disclaimer: 'SYNTHETIC REPLAY EVIDENCE',
     result:
       adapter === 'ts'
-        ? { trace: { hops: 3, netProfitUsd: 10 } }
-        : { survivors: [{ hops: 3, realizedNetUsd: 10 }] },
+        ? { trace: { hops: 3, loanUsd: 5000, realizedRatio: 1.0359295043171466, netProfitUsd: 165.14752158573293 } }
+        : {
+            survivors: [
+              { hops: 3, bestLoanUsd: 5000, realizedRatio: 1.0359295043171466, realizedNetUsd: 165.14752158573293 },
+            ],
+          },
   };
 }
 
@@ -89,6 +93,67 @@ test.describe('replay boundary: fail-closed pairing validator', () => {
     const result = validatePairing(baseEnvelope('ts'), rs);
     expect(result.comparison.hopsMatch).toBe(false);
     expect(result.pass).toBe(false);
+  });
+
+  test('shadow comparison passes an economic-magnitude comparison within tolerance', () => {
+    const result = validatePairing(baseEnvelope('ts'), baseEnvelope('rust'));
+    expect(result.comparison.economicsComparable).toBe(true);
+    expect(result.comparison.loanUsdMatches).toBe(true);
+    expect(result.comparison.realizedRatioMatches).toBe(true);
+    expect(result.comparison.netProfitMatches).toBe(true);
+    expect(result.comparison.economicsMatch).toBe(true);
+    expect(result.pass).toBe(true);
+  });
+
+  test('shadow comparison tolerates tiny float-vs-integer rounding drift within documented tolerance', () => {
+    const rs = baseEnvelope('rust');
+    // Perturb by far less than the documented tolerances (1e-6 relative on
+    // ratio, 1e-4 relative on net profit) to simulate f64-vs-U256 rounding.
+    rs.result.survivors[0].realizedRatio *= 1 + 1e-9;
+    rs.result.survivors[0].realizedNetUsd *= 1 + 1e-8;
+    const result = validatePairing(baseEnvelope('ts'), rs);
+    expect(result.comparison.economicsMatch).toBe(true);
+    expect(result.pass).toBe(true);
+  });
+
+  test('fails closed when best loan size diverges between adapters', () => {
+    const rs = baseEnvelope('rust');
+    rs.result.survivors[0].bestLoanUsd = 1000;
+    const result = validatePairing(baseEnvelope('ts'), rs);
+    expect(result.comparison.loanUsdMatches).toBe(false);
+    expect(result.comparison.economicsMatch).toBe(false);
+    expect(result.pass).toBe(false);
+  });
+
+  test('fails closed when realized ratio diverges beyond tolerance', () => {
+    const rs = baseEnvelope('rust');
+    rs.result.survivors[0].realizedRatio = 1.5; // grossly different magnitude
+    const result = validatePairing(baseEnvelope('ts'), rs);
+    expect(result.comparison.realizedRatioMatches).toBe(false);
+    expect(result.pass).toBe(false);
+  });
+
+  test('fails closed when net profit USD diverges beyond tolerance', () => {
+    const rs = baseEnvelope('rust');
+    rs.result.survivors[0].realizedNetUsd = 500; // grossly different magnitude, same sign
+    const result = validatePairing(baseEnvelope('ts'), rs);
+    expect(result.comparison.tsProfitable).toBe(true);
+    expect(result.comparison.rsProfitable).toBe(true);
+    expect(result.comparison.profitabilitySignMatches).toBe(true);
+    expect(result.comparison.netProfitMatches).toBe(false);
+    expect(result.pass).toBe(false);
+  });
+
+  test('fails closed as an incompatibility result when magnitude fields are missing from the schema', () => {
+    const ts = baseEnvelope('ts');
+    delete ts.result.trace.realizedRatio;
+    const result = validatePairing(ts, baseEnvelope('rust'));
+    expect(result.comparison.economicsComparable).toBe(false);
+    expect(result.comparison.economicsMatch).toBe(false);
+    expect(result.pass).toBe(false);
+    expect(
+      result.checks.some((c) => !c.ok && c.check.includes('comparable economic magnitude fields')),
+    ).toBe(true);
   });
 });
 

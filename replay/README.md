@@ -36,9 +36,11 @@ production data path.
 5. A **fail-closed pairing validator + manifest generator**
    (`scripts/replay/manifest.mjs`) that verifies both envelopes are a genuine,
    untampered pair and performs a **shadow comparison** of the overlapping
-   economics (hop count, profitability sign) the two adapters can agree on. It
-   writes `replay/out/manifest.json` **only on success**; any pairing failure
-   exits non-zero and writes nothing.
+   economics the two adapters can agree on: hop count, profitability sign, and
+   economic **magnitude** (best loan size, realized ratio, net profit USD,
+   within documented tolerances — see "Shadow comparison / handoff" below). It
+   writes `replay/out/manifest.json` **only on success**; any pairing or
+   magnitude-comparison failure exits non-zero and writes nothing.
 
 ## Hash derivation (why TS and Rust match exactly)
 
@@ -66,10 +68,38 @@ The TypeScript and Rust adapters model **different domains** — a ranked
 no existing cross-language, apples-to-apples comparison tool in this repo
 (`scripts/execution-policy-report.mjs` and `scripts/profitability-gates.mjs`
 are single-language, live-data reports). `scripts/replay/manifest.mjs` performs
-the shadow comparison this replay boundary owns today: hop count and
-profitability sign must agree between both adapters over the same fixture. A
-future phase could extend this to magnitude-level comparison once both
-simulators share identical fixed-point swap math.
+the shadow comparison this replay boundary owns today, over the SAME 3-hop
+fixture loop:
+
+- **Hop count** must match exactly.
+- **Profitability sign** must match exactly.
+- **Economic magnitude** must match within documented tolerances:
+  - **Best loan size** (`trace.loanUsd` vs. `survivors[0].bestLoanUsd`) must
+    match **exactly** — both adapters sweep the identical finite loan-size
+    candidate list from the fixture (`pipelineParams.loanSizesUsd`), so a
+    divergence here means the two simulators disagree about which trade size
+    is optimal, not numeric noise.
+  - **Realized ratio** (`trace.realizedRatio` vs. `survivors[0].realizedRatio`)
+    must match within **1e-6 relative tolerance**.
+  - **Net profit USD** (`trace.netProfitUsd` vs. `survivors[0].realizedNetUsd`)
+    must match within **1e-4 relative tolerance** (with a `$0.01` absolute
+    floor near the profitability breakeven boundary).
+
+Both adapters implement the identical constant-product-with-fee formula
+(`out = in*(1-fee)*reserveOut / (reserveIn + in*(1-fee))`; see
+`scanner-rust/src/sim.rs`'s "Swap math fidelity" doc and `ts-adapter.ts`'s
+`simulateV2Hop`) over the same fixture bytes, so any real divergence beyond
+float-vs-U256 rounding indicates the TS estimate no longer tracks `sim.rs`.
+On the current fixture the two adapters produce **bit-identical** magnitude
+values, so the tolerances above exist purely as headroom for future fixtures
+with less "round" numbers — not because drift is currently observed.
+
+**Fail-closed on incompatibility**: if either envelope's schema doesn't expose
+all three magnitude fields as finite numbers, the comparison is marked
+`economicsComparable: false` and the pairing **fails** — a schema mismatch or
+missing field is never silently treated as a pass. `manifest.json` is written
+only when hop count, profitability sign, AND economic magnitude all agree; any
+mismatch removes a stale passing manifest and exits non-zero.
 
 ## Running it
 
@@ -106,11 +136,17 @@ cargo test --manifest-path scanner-rust/Cargo.toml --test replay_tests  # Rust: 
 - The TS adapter's constant-product simulator is a **replay-only** economic
   estimate (`number`-based) for building a realistic `CanonicalOpportunity`;
   it does not carry the same integer/on-chain-exact fidelity as the Rust
-  `sim.rs` engine. The Rust adapter is the source of truth for
-  executable-payload-grade numbers.
-- The shadow comparison currently checks hop count and profitability sign
-  only, not profit magnitude, because the two domains don't share identical
-  swap math yet.
+  `sim.rs` engine. The Rust adapter remains the source of truth for
+  executable-payload-grade numbers — the magnitude comparison verifies the TS
+  estimate stays within tolerance of that source of truth, it does not make
+  the TS number authoritative.
+- The shadow comparison now checks hop count, profitability sign, AND
+  economic magnitude (best loan size, realized ratio, net profit USD), but
+  only over the one synthetic 3-hop fixture this workflow ships. A future
+  phase could add more fixtures (different hop counts, fee tiers, V3 pools) to
+  broaden magnitude-comparison coverage.
 - This workflow is entirely synthetic/offline. It does not — and must not —
   replace live scanner readiness checks (`scripts/scanner-readiness.mjs`) or
-  production profitability gates (`scripts/profitability-gates.mjs`).
+  production profitability gates (`scripts/profitability-gates.mjs`). Parity is
+  demonstrated **only for this deterministic replay fixture**, not for live
+  on-chain conditions.

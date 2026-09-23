@@ -4,17 +4,20 @@
 // replay/out/rs-envelope.json), verifies they are a genuine, unmodified pair
 // (same envelopeVersion, same runId/inputHash/sourceHash/fixtureVersion, one
 // "ts" adapter and one "rust" adapter — never two of the same), and performs a
-// shadow comparison of the overlapping economics the two adapters can agree on
-// (hop count and profitability sign). ANY pairing failure is FAIL-CLOSED: the
-// process exits non-zero and NO manifest file is written, so a manifest on
-// disk always means the pairing was verified.
+// shadow comparison of the overlapping economics the two adapters can agree on:
+// hop count, profitability sign, AND economic MAGNITUDE (best loan size,
+// realized ratio, net profit USD, within documented tolerances). ANY pairing
+// or comparison failure is FAIL-CLOSED: the process exits non-zero and NO
+// manifest file is written, so a manifest on disk always means the pairing
+// AND the magnitude comparison were both verified.
 //
 // Shadow-comparison handoff: this repo has no existing cross-language
 // scanner-output comparison tool (only single-language economics reports such
 // as scripts/execution-policy-report.mjs and scripts/profitability-gates.mjs),
 // so the comparison performed here IS the shadow comparison for this replay
-// boundary. A later phase could extend it to compare realized-ratio magnitude
-// once the TS and Rust simulators share identical fixed-point math.
+// boundary. Magnitude comparison is fail-closed on incompatibility: if either
+// envelope's schema doesn't expose comparable numeric fields, the pairing
+// fails rather than silently passing on synthetic evidence.
 //
 // Run: node scripts/replay/manifest.mjs
 
@@ -32,6 +35,42 @@ export const RS_ENVELOPE_PATH = path.join(OUT_DIR, 'rs-envelope.json');
 export const MANIFEST_PATH = path.join(OUT_DIR, 'manifest.json');
 
 const ENVELOPE_VERSION = 'scanner-evidence-v1';
+
+// Magnitude-level economic tolerances between the TS (float, replay-only
+// estimate) and Rust (U256 integer, source-of-truth) simulators. Both
+// implement the IDENTICAL constant-product-with-fee formula
+// (`out = in*(1-fee)*reserveOut / (reserveIn + in*(1-fee))`, see
+// `scanner-rust/src/sim.rs` "Swap math fidelity" and `ts-adapter.ts`'s
+// `simulateV2Hop`) over the SAME fixture, so a genuine divergence beyond
+// float/integer rounding means the TS estimate no longer tracks sim.rs.
+// - REALIZED_RATIO: a single quotient close to 1.0 with no compounding
+//   subtraction, so its rounding error stays near f64 precision; 1e-6
+//   relative leaves ~6 orders of magnitude of margin over observed
+//   float-vs-U256 drift (bit-identical on this fixture).
+// - NET_PROFIT_USD: subtracts two more terms (Aave premium, gas) from the
+//   same ratio, so its relative error can compound slightly more for small
+//   loan sizes; 1e-4 relative (1 bps) still easily catches a genuine
+//   multi-percent magnitude disagreement.
+// - ABS_EPSILON_USD: absolute floor so the relative tolerance doesn't
+//   collapse to ~0 right at the profitability breakeven boundary.
+export const REALIZED_RATIO_REL_TOLERANCE = 1e-6;
+export const NET_PROFIT_REL_TOLERANCE = 1e-4;
+export const NET_PROFIT_ABS_EPSILON_USD = 0.01;
+
+function isFiniteNumber(v) {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/** Relative-with-absolute-floor tolerance check, used for economic magnitude
+ * comparisons where the two languages compute the same quantity via
+ * different numeric representations (f64 vs U256-then-f64). */
+function withinTolerance(a, b, relTol, absEpsilon = 0) {
+  const diff = Math.abs(a - b);
+  if (diff <= absEpsilon) return true;
+  const scale = Math.max(Math.abs(a), Math.abs(b), 1e-12);
+  return diff / scale <= relTol;
+}
+
 const REQUIRED_FIELDS = [
   'envelopeVersion',
   'runId',
@@ -110,12 +149,58 @@ export function validatePairing(tsEnvelope, rsEnvelope) {
 
   // Shadow comparison: the two adapters model different domains (a TS
   // "canonical opportunity" vs a Rust execution-payload survivor report), but
-  // both walk the SAME 3-hop fixture loop, so hop count and profitability sign
-  // must agree. This is the cross-adapter check this replay boundary owns.
+  // both walk the SAME 3-hop fixture loop through the SAME swap formula, so
+  // hop count, profitability sign, AND economic magnitude (loan size,
+  // realized ratio, net profit) must agree within tolerance. This is the
+  // cross-adapter check this replay boundary owns.
   const tsHops = tsEnvelope.result?.trace?.hops;
   const rsHops = rsEnvelope.result?.survivors?.[0]?.hops;
   const tsProfitable = (tsEnvelope.result?.trace?.netProfitUsd ?? 0) > 0;
   const rsProfitable = (rsEnvelope.result?.survivors?.[0]?.realizedNetUsd ?? 0) > 0;
+
+  const tsLoanUsd = tsEnvelope.result?.trace?.loanUsd;
+  const rsLoanUsd = rsEnvelope.result?.survivors?.[0]?.bestLoanUsd;
+  const tsRealizedRatio = tsEnvelope.result?.trace?.realizedRatio;
+  const rsRealizedRatio = rsEnvelope.result?.survivors?.[0]?.realizedRatio;
+  const tsNetProfitUsd = tsEnvelope.result?.trace?.netProfitUsd;
+  const rsNetProfitUsd = rsEnvelope.result?.survivors?.[0]?.realizedNetUsd;
+
+  // Fail-closed on incompatibility: if either envelope doesn't expose all
+  // three comparable magnitude fields as finite numbers, the economics are
+  // NOT comparable — this must never be silently treated as a pass.
+  const economicsComparable =
+    isFiniteNumber(tsLoanUsd) &&
+    isFiniteNumber(rsLoanUsd) &&
+    isFiniteNumber(tsRealizedRatio) &&
+    isFiniteNumber(rsRealizedRatio) &&
+    isFiniteNumber(tsNetProfitUsd) &&
+    isFiniteNumber(rsNetProfitUsd);
+
+  // Both adapters sweep the SAME finite loan-size candidate list from the
+  // shared fixture (`pipelineParams.loanSizesUsd`), so the winning loan size
+  // must match EXACTLY — a divergence here means the two simulators disagree
+  // about which trade size is optimal, which is a real economic divergence,
+  // not numeric noise.
+  const loanUsdMatches = economicsComparable && tsLoanUsd === rsLoanUsd;
+  const realizedRatioMatches =
+    economicsComparable && withinTolerance(tsRealizedRatio, rsRealizedRatio, REALIZED_RATIO_REL_TOLERANCE);
+  const netProfitMatches =
+    economicsComparable &&
+    withinTolerance(tsNetProfitUsd, rsNetProfitUsd, NET_PROFIT_REL_TOLERANCE, NET_PROFIT_ABS_EPSILON_USD);
+  const economicsMatch = economicsComparable && loanUsdMatches && realizedRatioMatches && netProfitMatches;
+
+  check(economicsComparable, 'both envelopes expose comparable economic magnitude fields (loanUsd, realizedRatio, netProfitUsd)');
+  if (economicsComparable) {
+    check(loanUsdMatches, `best loan size matches exactly (ts=${tsLoanUsd} rust=${rsLoanUsd})`);
+    check(
+      realizedRatioMatches,
+      `realized ratio within ${REALIZED_RATIO_REL_TOLERANCE} relative tolerance (ts=${tsRealizedRatio} rust=${rsRealizedRatio})`,
+    );
+    check(
+      netProfitMatches,
+      `net profit USD within ${NET_PROFIT_REL_TOLERANCE} relative / ${NET_PROFIT_ABS_EPSILON_USD} abs tolerance (ts=${tsNetProfitUsd} rust=${rsNetProfitUsd})`,
+    );
+  }
 
   const comparison = {
     tsHops,
@@ -124,11 +209,26 @@ export function validatePairing(tsEnvelope, rsEnvelope) {
     tsProfitable,
     rsProfitable,
     profitabilitySignMatches: tsProfitable === rsProfitable,
+    economicsComparable,
+    tsLoanUsd,
+    rsLoanUsd,
+    loanUsdMatches,
+    tsRealizedRatio,
+    rsRealizedRatio,
+    realizedRatioMatches,
+    realizedRatioRelTolerance: REALIZED_RATIO_REL_TOLERANCE,
+    tsNetProfitUsd,
+    rsNetProfitUsd,
+    netProfitMatches,
+    netProfitRelTolerance: NET_PROFIT_REL_TOLERANCE,
+    netProfitAbsEpsilonUsd: NET_PROFIT_ABS_EPSILON_USD,
+    economicsMatch,
     note:
-      'No pre-existing cross-language scanner comparison tool was found in this repo; this manifest performs the shadow comparison. A future phase could add magnitude-level comparison once both simulators share fixed-point math.',
+      'Shadow comparison covers hop count, profitability sign, AND economic magnitude (best loan size exact match; realized ratio and net profit USD within documented relative tolerances). Magnitude comparison is fail-closed: missing/non-numeric fields or an out-of-tolerance value both cause the pairing to fail.',
   };
 
-  return { pass: pass && comparison.hopsMatch && comparison.profitabilitySignMatches, checks, comparison };
+  const magnitudeOk = comparison.hopsMatch && comparison.profitabilitySignMatches && economicsMatch;
+  return { pass: pass && magnitudeOk, checks, comparison };
 }
 
 export function generateManifest() {
@@ -184,7 +284,10 @@ function main() {
     for (const c of manifest.checks.filter((x) => !x.ok)) {
       console.error(`  ✗ ${c.check}`);
     }
-    if (manifest.comparison && (!manifest.comparison.hopsMatch || !manifest.comparison.profitabilitySignMatches)) {
+    if (
+      manifest.comparison &&
+      (!manifest.comparison.hopsMatch || !manifest.comparison.profitabilitySignMatches || !manifest.comparison.economicsMatch)
+    ) {
       console.error(`  ✗ shadow comparison mismatch: ${JSON.stringify(manifest.comparison)}`);
     }
     process.exitCode = 1;
