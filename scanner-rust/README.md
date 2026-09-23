@@ -121,6 +121,17 @@ liquid Arbitrum pairs are mirages that price impact erases. The pipeline never
 weakens a gate to manufacture a survivor. `tests/pipeline_integration_tests.rs`
 proves the whole path deterministically over a synthetic fixture (no RPC).
 
+### Deterministic replay boundary
+`examples/replay_adapter.rs` (logic in `src/replay.rs`) runs the SAME shared
+fixture used by the TypeScript adapter through this pipeline and emits a
+`scanner-evidence-v1` envelope paired against the TS side by matching
+`runId`/`inputHash`/`sourceHash`. See `../replay/README.md` for the full
+read-only, cross-language replay workflow.
+```bash
+cargo run --example replay_adapter                 # writes ../replay/out/rs-envelope.json
+cargo test --test replay_tests                      # determinism + envelope-shape tests
+```
+
 ## Environment
 Set at least one RPC URL and the matching contract address for live execution.
 For the Arbitrum pool feed set one of `SCANNER_RPC_URL`, `ARBITRUM_RPC_URL`, or

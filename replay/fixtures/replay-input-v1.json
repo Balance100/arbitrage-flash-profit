@@ -1,0 +1,57 @@
+{
+  "fixtureVersion": "replay-input-v1",
+  "description": "SYNTHETIC, read-only fixture for the deterministic replay boundary. Mirrors scanner-rust's `payload::fixtures::synthetic_detectable_edges` 3-hop loop (asset -> tokenB -> tokenC -> asset) so both the TypeScript and Rust adapters exercise the SAME closed cycle and reach the SAME pairing hashes. NOT live data. NOT production evidence.",
+  "network": "fixture",
+  "edges": [
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000001",
+      "tokenOut": "0x0000000000000000000000000000000000000002",
+      "router": "0x000000000000000000000000000000000000000b",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 3000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    },
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000002",
+      "tokenOut": "0x0000000000000000000000000000000000000003",
+      "router": "0x000000000000000000000000000000000000000c",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 3000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    },
+    {
+      "tokenIn": "0x0000000000000000000000000000000000000003",
+      "tokenOut": "0x0000000000000000000000000000000000000001",
+      "router": "0x000000000000000000000000000000000000000d",
+      "dex": "synthetic-fixture",
+      "price": 1.02,
+      "feePpm": 3000,
+      "reserveIn": "1000000000000000000000000",
+      "reserveOut": "1020000000000000000000000",
+      "decIn": 18,
+      "decOut": 18,
+      "isV3": false
+    }
+  ],
+  "usdPrices": {
+    "0x0000000000000000000000000000000000000001": 1.0,
+    "0x0000000000000000000000000000000000000002": 1.0,
+    "0x0000000000000000000000000000000000000003": 1.0
+  },
+  "pipelineParams": {
+    "aaveBps": 5.0,
+    "loanSizesUsd": [1000.0, 5000.0],
+    "gasUsdPerHop": 4.0,
+    "slippageBps": 50
+  }
+}

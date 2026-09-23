@@ -31,3 +31,7 @@ dist-ssr
 
 # Supabase
 .supabase
+
+# Replay boundary generated artifacts (deterministic, regenerable from
+# replay/fixtures/ + the ts/rust adapters — never hand-edited or committed)
+replay/out/
