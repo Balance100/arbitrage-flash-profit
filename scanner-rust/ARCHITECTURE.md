@@ -3,7 +3,7 @@
 ## Components
 - `config.rs`: environment-driven runtime configuration (incl. `resolve_arbitrum_rpc_url`)
 - `scanner.rs`: pool graph construction and fee-aware Bellman-Ford cycle detection
-- `pools.rs`: live Arbitrum multi-DEX pool feed (Phase 3) + USD price map + block number + Phase 8 bounded V3 cross-tick data (tick bitmap + `liquidityNet`)
+- `pools.rs`: live Arbitrum multi-DEX pool feed (Phase 3) + Phase 9 long-tail universe (vetted registry, on-chain `decimals()`, consensus+depth USD anchor, two-tier liquidity floor, token/pool caps, non-standard-token guard) + USD price map + block number + Phase 8 bounded V3 cross-tick data (tick bitmap + `liquidityNet`)
 - `sim.rs`: Phase 4/8 price-impact SIMULATION gate (V2 exact; V3 exact FULL cross-tick swap walk, bounded + fail-closed)
 - `payload.rs`: Phase 6 N-hop executable-payload builder + fail-closed DRY-RUN validator + synthetic fixtures
 - `flashlight.rs`: ABI encoding for the Phase 5 `executeArbitrage(address,uint256,Hop[])` contract
@@ -57,6 +57,51 @@ quoting only within the current tick-spacing interval:
 - **Bucket effect.** Cycles previously `rejected_unsimulable` *only* because a V3
   leg crossed a tick are now simulated → **survive** or honest `rejected_negative`.
   Within-interval trades produce byte-identical output to the old math (tested).
+
+## Long-tail token/pool universe expansion (Phase 9)
+Phase 9 grows the edge set from the 11 blue-chips (~110 edges) toward the long
+tail where persistent inefficiency lives, while keeping every anti-mirage gate
+fail-closed. It adds **no new venue** (Uniswap V3 + SushiSwap V2 only) and does
+**not** touch `executor.rs`; it feeds a bigger, still-honest edge set into the
+unchanged Bellman-Ford + net-profit + sim-gate + payload pipeline. All logic lives
+in `pools.rs::fetch_arbitrum_pools_with_usd_at_block` and its helpers.
+
+- **Vetted registry + on-chain decimals (`arbitrum_tokens`, `read_onchain_decimals`,
+  `resolve_effective_tokens`).** Long-tail addresses are cross-verified across ≥2
+  reputable token lists (never guessed). `decimals()` is read on-chain for every
+  token; blue-chips fall back to their verified constant (cross-checked, never
+  dropped), long-tail tokens with unreadable decimals are dropped fail-closed.
+- **Consensus + depth USD anchor (`derive_usd_prices`, `anchor_token_usd`).** Ports
+  the proven TS `deriveUsdReferenceAnchor` to Rust: for each token, gather every
+  implied USD quote (tagged with its pool's USD depth), require
+  `SCANNER_MIN_ANCHOR_VENUES` quotes within `SCANNER_ANCHOR_OUTLIER_PCT` of their
+  median, then pick the deepest survivor. Un-corroborated tokens stay un-priced and
+  are dropped by the liquidity gate — never valued on a guess. Deterministic:
+  quotes are gathered from a per-pass snapshot, so HashMap order cannot change the
+  result.
+- **Two-tier liquidity floor + caps (`min_liquidity_for_pool`, `cap_tokens`,
+  `cap_by_depth`).** Blue-chip floor `SCANNER_MIN_POOL_LIQUIDITY_USD` vs the higher
+  long-tail floor `SCANNER_MIN_LONGTAIL_POOL_LIQUIDITY_USD`; `SCANNER_MAX_TOKENS`
+  (blue-chips always kept) and `SCANNER_MAX_POOLS` (deepest-by-USD) bound the graph.
+  Cross-tick data is fetched only for pools that survive the gate + cap.
+- **Non-standard token guard (`v2_balance_consistent`, `is_denylisted`).** A V2
+  reserves-vs-`balanceOf` divergence beyond `SCANNER_V2_BALANCE_TOLERANCE_PCT` flags
+  a fee-on-transfer/rebasing token and drops it from ALL its pools (incl. V3); a
+  documented denylist covers known-bad tokens; the consensus/depth gate rejects the
+  rest. When in doubt, exclude.
+- **Bounded, fail-closed RPC.** New `decimals()` reads and the enlarged
+  discovery/state batches reuse `batch_in_chunks` + the `MAX_BATCH_FAILURE_FRACTION`
+  guard; a degraded batch shrinks the long-tail toward the safe blue-chip baseline
+  rather than fabricating state. Blue-chips, venue math, and all downstream gates
+  are unchanged.
+- **Throttle-vs-gate telemetry (`DiscoveryTelemetry`).** `fetch_arbitrum_pools_with_usd_at_block`
+  returns a per-fetch, reporting-only telemetry record (it never influences gating):
+  probes attempted/failed, state calls attempted/failed, pools dropped for
+  *incomplete state* (throttle-sensitive) vs *honest gates*
+  (`no_decimals`/`denylist`/`bad_price`/`nonstandard`/`liquidity`), and
+  `throttle_suspected()` (any failure rate above `THROTTLE_WARN_PCT`). This lets a
+  reviewer distinguish an HONEST-ZERO edge set from a silent RPC throttle-collapse;
+  the capstone example prints it per block and an aggregate baseline-vs-expanded line.
 
 ## Legacy single-shot flow
 1. Load config and logging.

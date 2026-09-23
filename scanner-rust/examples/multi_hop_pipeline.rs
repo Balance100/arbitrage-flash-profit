@@ -44,11 +44,18 @@ use mev_scanner::payload::{
     validate_execution_payload, ExecutionPayload,
 };
 use mev_scanner::pipeline::{run_sample, PipelineParams, SampleReport, SurvivorReport};
-use mev_scanner::pools::fetch_arbitrum_pools_with_usd_at_block;
+use mev_scanner::pools::{fetch_arbitrum_pools_with_usd_at_block, DiscoveryTelemetry};
 use mev_scanner::sim::simulate_cycle_hops;
 
 const DEFAULT_SAMPLES: usize = 3;
 const DEFAULT_SAMPLE_DELAY_SECS: u64 = 5;
+
+/// Historical blue-chip-only baseline (through Phase 8): the 11 curated
+/// Arbitrum blue-chips probed across Uni V3 (3 tiers) + Sushi V2, which loaded
+/// on the order of ~110 directional edges. Phase 9's whole point is to grow this
+/// HONESTLY, so every live report contrasts the expanded numbers against it.
+const BASELINE_TOKENS: usize = 11;
+const BASELINE_EDGES: usize = 110;
 
 fn samples_from_env() -> usize {
     std::env::var("SCANNER_LIVE_SAMPLES")
@@ -112,6 +119,51 @@ fn print_sample(idx: usize, r: &SampleReport) {
     }
 }
 
+/// Print one sample's discovery telemetry — the THROTTLE-vs-GATE proof that lets a
+/// reviewer tell an honest small/zero edge set from an RPC-throttle collapse.
+fn print_telemetry(t: &DiscoveryTelemetry) {
+    println!(
+        "     universe: tokens_loaded={} ({} blue + {} long-tail) of {} registered \
+         | pools_discovered={} kept={} edges_loaded={}",
+        t.tokens_loaded,
+        t.bluechip_loaded,
+        t.longtail_loaded,
+        t.registry_tokens,
+        t.pools_discovered,
+        t.pools_kept,
+        t.edges_loaded
+    );
+    println!(
+        "     throttle: discovery_failed={}/{} ({:.1}%) state_failed={}/{} ({:.1}%) \
+         incomplete_state={} -> throttle_drops={} throttle_suspected={}",
+        t.discovery_probes_failed,
+        t.discovery_probes,
+        t.discovery_fail_pct(),
+        t.state_calls_failed,
+        t.state_calls,
+        t.state_fail_pct(),
+        t.pools_dropped_incomplete_state,
+        t.throttle_drops(),
+        t.throttle_suspected()
+    );
+    println!(
+        "     gate: no_decimals={} denylist={} bad_price={} nonstandard={} liquidity={} \
+         (unpriced_leg={}) capped={} -> gate_drops={}",
+        t.tokens_dropped_no_decimals,
+        t.tokens_dropped_denylist,
+        t.pools_dropped_bad_price,
+        t.pools_dropped_nonstandard,
+        t.pools_dropped_liquidity,
+        t.pools_unpriced_leg,
+        t.pools_capped,
+        t.gate_drops()
+    );
+    println!(
+        "     baseline vs expanded: tokens {BASELINE_TOKENS} -> {} | edges ~{BASELINE_EDGES} -> {}",
+        t.tokens_loaded, t.edges_loaded
+    );
+}
+
 async fn live_pass(params: &PipelineParams) -> eyre::Result<()> {
     let Some(rpc_url) = resolve_arbitrum_rpc_url() else {
         println!("== LIVE PASS SKIPPED: no RPC (set ALCHEMY_API_KEY / SCANNER_RPC_URL / ARBITRUM_RPC_URL) ==");
@@ -130,15 +182,18 @@ async fn live_pass(params: &PipelineParams) -> eyre::Result<()> {
     println!("---");
 
     let mut reports: Vec<SampleReport> = Vec::with_capacity(samples);
+    let mut teles: Vec<DiscoveryTelemetry> = Vec::with_capacity(samples);
     for i in 0..samples {
         if i > 0 {
             tokio::time::sleep(delay).await;
         }
         match fetch_arbitrum_pools_with_usd_at_block(&rpc_url).await {
-            Ok((edges, usd_prices, block)) => {
+            Ok((edges, usd_prices, block, tele)) => {
                 let report = run_sample(&edges, &usd_prices, Some(block), params);
                 print_sample(i, &report);
+                print_telemetry(&tele);
                 reports.push(report);
+                teles.push(tele);
             }
             Err(e) => {
                 println!("-- sample {i}: pool fetch FAILED (skipped honestly): {e}");
@@ -160,6 +215,34 @@ async fn live_pass(params: &PipelineParams) -> eyre::Result<()> {
         total_neg,
         total_unsim
     );
+    if !teles.is_empty() {
+        let n = teles.len() as f64;
+        let avg_tokens = teles.iter().map(|t| t.tokens_loaded).sum::<usize>() as f64 / n;
+        let avg_edges = teles.iter().map(|t| t.edges_loaded).sum::<usize>() as f64 / n;
+        let max_edges = teles.iter().map(|t| t.edges_loaded).max().unwrap_or(0);
+        let any_throttle = teles.iter().any(|t| t.throttle_suspected());
+        println!(
+            "LIVE UNIVERSE: baseline {BASELINE_TOKENS} tokens / ~{BASELINE_EDGES} edges -> expanded \
+             avg {avg_tokens:.1} tokens / {avg_edges:.1} edges (peak {max_edges} edges) across {} sample(s). \
+             throttle_suspected_any={any_throttle}",
+            teles.len()
+        );
+        if any_throttle {
+            println!(
+                "LIVE WARNING: at least one sample exceeded the {:.0}% throttle-warning bar, so a \
+                 small edge set may be a throttle artifact — see per-sample throttle lines above. \
+                 Consider lowering SCANNER_MAX_TOKENS and re-running.",
+                mev_scanner::pools::THROTTLE_WARN_PCT
+            );
+        } else {
+            println!(
+                "LIVE COVERAGE HONEST: every sample stayed under the {:.0}% throttle-warning bar on \
+                 both discovery and state batches — the expanded universe loaded cleanly, so the \
+                 survivor verdict below reflects real economics, not silent RPC drops.",
+                mev_scanner::pools::THROTTLE_WARN_PCT
+            );
+        }
+    }
     if total_survived == 0 {
         println!(
             "LIVE RESULT: ZERO survivors across all sampled blocks. Every spot cycle collapsed once \

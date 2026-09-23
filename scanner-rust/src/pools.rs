@@ -30,11 +30,20 @@ use tracing::{debug, info, warn};
 use crate::types::{PoolEdge, PoolSwapState, V3CrossTickData, V3Tick};
 
 /// A verified Arbitrum token with its canonical address and ERC-20 decimals.
+///
+/// `decimals` is the vetted registry value: authoritative for the 11 blue-chips
+/// and a cross-check hint for the long-tail set. The live feed still reads every
+/// token's `decimals()` ON-CHAIN (see [`read_onchain_decimals`]) and never
+/// assumes a long-tail token's decimals — a long-tail token whose `decimals()`
+/// cannot be read is dropped (fail-closed).
 #[derive(Debug, Clone, Copy)]
 pub struct TokenInfo {
     pub symbol: &'static str,
     pub address: Address,
     pub decimals: u8,
+    /// True for the 11 curated blue-chips (the USD-anchor backbone, always kept
+    /// with a resilient decimals fallback); false for the Phase 9 long-tail set.
+    pub blue_chip: bool,
 }
 
 /// Uniswap V3 factory (identical address across all chains it is deployed on).
@@ -51,16 +60,166 @@ const SEL_BALANCE_OF: [u8; 4] = [0x70, 0xa0, 0x82, 0x31]; // balanceOf(address)
 const SEL_LIQUIDITY: [u8; 4] = [0x1a, 0x68, 0x65, 0x02]; // liquidity()
 const SEL_TICK_BITMAP: [u8; 4] = [0x53, 0x39, 0xc2, 0x96]; // tickBitmap(int16)
 const SEL_TICKS: [u8; 4] = [0xf3, 0x0d, 0xba, 0x93]; // ticks(int24)
+const SEL_DECIMALS: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67]; // decimals()
 
 /// Default minimum pool liquidity (USD) below which a pool is treated as dust
 /// and skipped, so near-empty/stale pools cannot manufacture fake spreads.
 /// Overridable via `SCANNER_MIN_POOL_LIQUIDITY_USD`.
 pub const DEFAULT_MIN_POOL_LIQUIDITY_USD: f64 = 5_000.0;
 
+/// Minimum pool liquidity (USD) for a pool that touches a NON-blue-chip
+/// (long-tail) token. Higher than the blue-chip floor because long-tail prices
+/// are easier to manipulate and need more depth to be trusted. Overridable via
+/// `SCANNER_MIN_LONGTAIL_POOL_LIQUIDITY_USD`.
+pub const DEFAULT_MIN_LONGTAIL_POOL_LIQUIDITY_USD: f64 = 25_000.0;
+
+/// Hard cap on the total token universe (blue-chips + long-tail) to bound the
+/// O(N^2) pair-probe discovery and keep RPC sane. `SCANNER_MAX_TOKENS`.
+pub const DEFAULT_MAX_TOKENS: usize = 64;
+
+/// Hard cap on the pools carried into edge-building / cross-tick fetch (the
+/// deepest by USD liquidity are kept). `SCANNER_MAX_POOLS`.
+pub const DEFAULT_MAX_POOLS: usize = 400;
+
+/// Minimum independent venue quotes that must corroborate a token's USD price
+/// before it is anchored; below this the token is left un-priced and its pools
+/// are dropped (fail-closed). `SCANNER_MIN_ANCHOR_VENUES`.
+pub const DEFAULT_MIN_ANCHOR_VENUES: usize = 2;
+
+/// Max % a venue quote may deviate from the median before it is discarded as an
+/// outlier when a consensus set exists. `SCANNER_ANCHOR_OUTLIER_PCT`.
+pub const DEFAULT_ANCHOR_OUTLIER_PCT: f64 = 3.0;
+
+/// Max % by which a V2 pool's live `balanceOf` may fall below its stored
+/// `getReserves()` before the token is treated as non-standard and dropped from
+/// ALL its pools (fail-closed). `SCANNER_V2_BALANCE_TOLERANCE_PCT`.
+pub const DEFAULT_V2_BALANCE_TOLERANCE_PCT: f64 = 1.0;
+
+/// Sane upper bound on ERC-20 decimals; an on-chain `decimals()` above this is
+/// treated as malformed and the token is dropped.
+const MAX_PLAUSIBLE_DECIMALS: u64 = 36;
+
 /// If more than this fraction of a discovery or state/balance batch fails, the
 /// RPC is treated as degraded/throttled and the fetch fails closed rather than
 /// building a partial graph (which would let the dust guard go inert).
 pub const MAX_BATCH_FAILURE_FRACTION: f64 = 0.20;
+
+/// Batch-failure fraction (%) above which coverage is flagged as possibly
+/// throttle-affected. Well below the hard [`MAX_BATCH_FAILURE_FRACTION`] abort
+/// bar: a run can complete "successfully" yet still have lost enough calls that a
+/// small/zero edge set is suspect rather than an honest result.
+pub const THROTTLE_WARN_PCT: f64 = 5.0;
+
+/// Honest per-fetch discovery telemetry (Phase 9). Lets a caller (and a reviewer)
+/// distinguish an HONEST-ZERO outcome — probes succeeded and candidates were
+/// removed by real economic / safety gates — from an RPC THROTTLE-COLLAPSE, where
+/// probes or state reads silently failed and the universe shrank for the wrong
+/// reason. This is a REPORTING artifact only: it is populated by
+/// [`fetch_arbitrum_pools_with_usd_at_block`] and never influences any gating
+/// decision. Counts are per single fetch (one block).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DiscoveryTelemetry {
+    /// Block the snapshot was read at.
+    pub block: u64,
+    /// Tokens in the full registry before capping.
+    pub registry_tokens: usize,
+    /// Effective tokens fed into pair discovery (blue-chip + long-tail).
+    pub tokens_loaded: usize,
+    /// Blue-chips among `tokens_loaded`.
+    pub bluechip_loaded: usize,
+    /// Long-tail tokens among `tokens_loaded`.
+    pub longtail_loaded: usize,
+    /// Long-tail tokens dropped because on-chain `decimals()` was unreadable.
+    pub tokens_dropped_no_decimals: usize,
+    /// Tokens dropped by the fee-on-transfer / non-standard denylist.
+    pub tokens_dropped_denylist: usize,
+    /// Factory getPool/getPair probes attempted.
+    pub discovery_probes: usize,
+    /// Discovery probes that belonged to a FAILED batch (RPC throttle signal).
+    pub discovery_probes_failed: usize,
+    /// Live pools discovered (non-zero factory addresses).
+    pub pools_discovered: usize,
+    /// Pool state/balance calls attempted.
+    pub state_calls: usize,
+    /// State/balance calls that belonged to a FAILED batch (RPC throttle signal).
+    pub state_calls_failed: usize,
+    /// Pools dropped because a required state read (price/liquidity/balance) was
+    /// missing — throttle-sensitive, NOT an honest economic rejection.
+    pub pools_dropped_incomplete_state: usize,
+    /// Pools dropped because price bytes were undecodable or implausible (a
+    /// decimals/ordering data-integrity guard).
+    pub pools_dropped_bad_price: usize,
+    /// Pools dropped for touching a token flagged non-standard by the V2
+    /// reserves-vs-balanceOf check (fee-on-transfer / rebasing guard).
+    pub pools_dropped_nonstandard: usize,
+    /// Pools dropped by the USD liquidity floor (dust / unvaluable).
+    pub pools_dropped_liquidity: usize,
+    /// Of the liquidity drops, how many had NO USD-anchored leg (un-priceable) —
+    /// informational subset of `pools_dropped_liquidity`.
+    pub pools_unpriced_leg: usize,
+    /// Pools trimmed by the `SCANNER_MAX_POOLS` depth cap (a bound, not a reject).
+    pub pools_capped: usize,
+    /// Pools that survived every gate and produced edges.
+    pub pools_kept: usize,
+    /// Directional edges built from the kept pools.
+    pub edges_loaded: usize,
+}
+
+impl DiscoveryTelemetry {
+    /// Candidates lost to RPC degradation (failed probes + failed state calls +
+    /// pools dropped for missing reads). A large value means a small edge set is
+    /// a THROTTLE artifact, not an honest result.
+    pub fn throttle_drops(&self) -> usize {
+        self.discovery_probes_failed + self.state_calls_failed + self.pools_dropped_incomplete_state
+    }
+
+    /// Candidates removed by real economic / safety / data-integrity gates
+    /// (decimals, denylist, bad price, non-standard, liquidity). A large value
+    /// with `throttle_suspected() == false` is an HONEST filtering result.
+    pub fn gate_drops(&self) -> usize {
+        self.tokens_dropped_no_decimals
+            + self.tokens_dropped_denylist
+            + self.pools_dropped_bad_price
+            + self.pools_dropped_nonstandard
+            + self.pools_dropped_liquidity
+    }
+
+    /// Percentage of discovery probes that failed.
+    pub fn discovery_fail_pct(&self) -> f64 {
+        if self.discovery_probes == 0 {
+            0.0
+        } else {
+            100.0 * self.discovery_probes_failed as f64 / self.discovery_probes as f64
+        }
+    }
+
+    /// Percentage of state/balance calls that failed.
+    pub fn state_fail_pct(&self) -> f64 {
+        if self.state_calls == 0 {
+            0.0
+        } else {
+            100.0 * self.state_calls_failed as f64 / self.state_calls as f64
+        }
+    }
+
+    /// Percentage of discovered pools dropped for incomplete state reads.
+    pub fn incomplete_state_pct(&self) -> f64 {
+        if self.pools_discovered == 0 {
+            0.0
+        } else {
+            100.0 * self.pools_dropped_incomplete_state as f64 / self.pools_discovered as f64
+        }
+    }
+
+    /// True when the RPC lost enough calls that this fetch's coverage (and hence a
+    /// small/zero edge set) should be treated as THROTTLE-affected rather than an
+    /// honest result: any of the failure rates exceeds [`THROTTLE_WARN_PCT`].
+    pub fn throttle_suspected(&self) -> bool {
+        self.discovery_fail_pct() > THROTTLE_WARN_PCT
+            || self.state_fail_pct() > THROTTLE_WARN_PCT
+            || self.incomplete_state_pct() > THROTTLE_WARN_PCT
+    }
+}
 
 /// Uniswap V3 fee tiers we probe, in hundredths-of-a-bip (ppm).
 pub const V3_FEE_TIERS: [u32; 3] = [500, 3000, 10000];
@@ -71,27 +230,179 @@ fn addr(s: &str) -> Address {
     s.parse().expect("hardcoded address is valid")
 }
 
-/// The verified Arbitrum token registry. Only canonical, well-known addresses
-/// are included; an unknown/guessed address would fabricate garbage prices.
+/// The verified Arbitrum token registry: the 11 curated blue-chips (the
+/// USD-anchor backbone, always kept) plus a cross-verified long-tail set added in
+/// Phase 9 to reach less-arbitraged mid/small-cap pools. Every address is a real,
+/// on-chain Arbitrum token: the blue-chips are canonical, and each long-tail
+/// address was taken from and CROSS-VERIFIED across >=2 reputable token lists
+/// (CoinGecko Arbitrum, the Arbitrum-bridged Uniswap Labs list, SushiSwap's
+/// list) — never guessed. Decimals here are vetted values; the live feed still
+/// reads `decimals()` on-chain for every token and drops any long-tail token it
+/// cannot read (see [`fetch_arbitrum_pools_with_usd_at_block`]).
+///
+/// The long-tail set is deliberately limited to STANDARD ERC-20s — no
+/// fee-on-transfer, no rebasing (e.g. wstETH/weETH/ezETH/cbETH are the
+/// NON-rebasing LST wrappers) — so non-standard-token math cannot fabricate
+/// profit. See [`fee_on_transfer_denylist`] for the dynamic-discovery guard.
 pub fn arbitrum_tokens() -> Vec<TokenInfo> {
     vec![
-        TokenInfo { symbol: "WETH", address: addr("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"), decimals: 18 },
-        TokenInfo { symbol: "USDC", address: addr("0xaf88d065e77c8cC2239327C5EDb3A432268e5831"), decimals: 6 },
-        TokenInfo { symbol: "USDCe", address: addr("0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"), decimals: 6 },
-        TokenInfo { symbol: "USDT", address: addr("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"), decimals: 6 },
-        TokenInfo { symbol: "ARB", address: addr("0x912CE59144191C1204E64559FE8253a0e49E6548"), decimals: 18 },
-        TokenInfo { symbol: "WBTC", address: addr("0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"), decimals: 8 },
-        TokenInfo { symbol: "GMX", address: addr("0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a"), decimals: 18 },
-        TokenInfo { symbol: "PENDLE", address: addr("0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8"), decimals: 18 },
-        TokenInfo { symbol: "MAGIC", address: addr("0x539bdE0d7Dbd336b79148AA742883198BBF60342"), decimals: 18 },
-        TokenInfo { symbol: "RDNT", address: addr("0x3082CC23568eA640225c2467653dB90e9250AaA0"), decimals: 18 },
-        TokenInfo { symbol: "DAI", address: addr("0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"), decimals: 18 },
+        // --- 11 curated blue-chips (preserved; the USD-anchor backbone) ---
+        TokenInfo { symbol: "WETH", address: addr("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1"), decimals: 18, blue_chip: true },
+        TokenInfo { symbol: "USDC", address: addr("0xaf88d065e77c8cC2239327C5EDb3A432268e5831"), decimals: 6, blue_chip: true },
+        TokenInfo { symbol: "USDCe", address: addr("0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8"), decimals: 6, blue_chip: true },
+        TokenInfo { symbol: "USDT", address: addr("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9"), decimals: 6, blue_chip: true },
+        TokenInfo { symbol: "ARB", address: addr("0x912CE59144191C1204E64559FE8253a0e49E6548"), decimals: 18, blue_chip: true },
+        TokenInfo { symbol: "WBTC", address: addr("0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f"), decimals: 8, blue_chip: true },
+        TokenInfo { symbol: "GMX", address: addr("0xfc5A1A6EB076a2C7aD06eD22C90d7E710E35ad0a"), decimals: 18, blue_chip: true },
+        TokenInfo { symbol: "PENDLE", address: addr("0x0c880f6761F1af8d9Aa9C466984b80DAb9a8c9e8"), decimals: 18, blue_chip: true },
+        TokenInfo { symbol: "MAGIC", address: addr("0x539bdE0d7Dbd336b79148AA742883198BBF60342"), decimals: 18, blue_chip: true },
+        TokenInfo { symbol: "RDNT", address: addr("0x3082CC23568eA640225c2467653dB90e9250AaA0"), decimals: 18, blue_chip: true },
+        TokenInfo { symbol: "DAI", address: addr("0xDA10009cBd5D07dd0CeCc66161FC93D7c9000da1"), decimals: 18, blue_chip: true },
+        // --- Phase 9 long-tail set (cross-verified across >=2 reputable lists) ---
+        TokenInfo { symbol: "1INCH", address: addr("0x6314c31a7a1652ce482cffe247e9cb7c3f4bb9af"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "AAVE", address: addr("0xba5ddd1f9d7f570dc94a51479a000e3bce967196"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "ACX", address: addr("0x53691596d1bce8cea565b84d4915e69e03d9c99d"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "BAL", address: addr("0x040d1edc9569d4bab2d15287dc5a4f10f56a56b8"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "CBETH", address: addr("0x1debd73e752beaf79865fd6446b0c970eae7732f"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "COMP", address: addr("0x354a6da3fcde098f8389cad84b0182725c6c91de"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "CRV", address: addr("0x11cdb42b0eb46d95f990bedd4695a6e3fa034978"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "DODO", address: addr("0x69eb4fa4a2fbd498c257c57ea8b7655a2559a581"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "EZETH", address: addr("0x2416092f143378750bb29b79ed961ab195cceea5"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "FRAX", address: addr("0x17fc002b466eec40dae837fc4be5c67993ddbd6f"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "GRT", address: addr("0x9623063377ad1b27544c965ccd7342f7ea7e88c7"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "JONES", address: addr("0x10393c20975cf177a3513071bc110f7962cd67da"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "LDO", address: addr("0x13ad51ed4f1b7e9dc168d8a00cb3f4ddd85efa60"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "LINK", address: addr("0xf97f4df75117a78c1a5a0dbb814af92458539fb4"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "LQTY", address: addr("0xfb9e5d956d889d91a82737b9bfcdac1dce3e1449"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "LUSD", address: addr("0x93b346b6bc2548da6a1e7d98e9a421b42541425b"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "MIM", address: addr("0xfea7a6a0b346362bf88a9e4a88416b77a57d6c2a"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "PLS", address: addr("0x51318b7d00db7acc4026c88c3952b66278b6a67f"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "PREMIA", address: addr("0x51fc0f6660482ea73330e414efd7808811a57fa2"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "RPL", address: addr("0xb766039cc6db368759c1e56b79affe831d0cc507"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "RSR", address: addr("0xca5ca9083702c56b481d1eec86f1776fdbd2e594"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "SILO", address: addr("0x0341c0c0ec423328621788d4854119b97f44e391"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "SOLVBTC", address: addr("0x3647c54c4c2c65bc7a2d63c0da2809b399dbbdc0"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "SPELL", address: addr("0x3e6648c5a70a150a88bce65f4ad4d506fe15d2af"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "STG", address: addr("0x6694340fc020c5e6b96567843da2df01b2ce1eb6"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "SUSHI", address: addr("0xd4d42f0b6def4ce0383636770ef773390d85c61a"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "TBTC", address: addr("0x6c84a8f1c29108f47a79964b5fe888d4f4d0de40"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "UNI", address: addr("0xfa7f8980b0f1e64a2062791cc3b0871572f1f7f0"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "USDS", address: addr("0x6491c05a82219b8d1479057361ff1654749b876b"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "WEETH", address: addr("0x35751007a407ca6feffe80b3cb397736d2cf4dbe"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "WSTETH", address: addr("0x5979d7b546e38e414f7e9822514be443a4800529"), decimals: 18, blue_chip: false },
+        TokenInfo { symbol: "YFI", address: addr("0x82e3a8f066a6989666b031d916c43672085b1582"), decimals: 18, blue_chip: false },
     ]
+}
+
+/// Whether `token` is one of the curated blue-chips in `registry`.
+pub fn is_blue_chip(token: Address, registry: &[TokenInfo]) -> bool {
+    registry.iter().any(|t| t.address == token && t.blue_chip)
+}
+
+/// Addresses known to be fee-on-transfer / rebasing / otherwise non-standard
+/// ERC-20s whose transfer semantics break constant-product / V3 output math and
+/// would fabricate profit. They are excluded from the universe unconditionally.
+///
+/// The curated Phase 9 registry is already limited to standard ERC-20s, so this
+/// list is the extension point for any FUTURE dynamically-discovered token. Add
+/// lowercase `0x…` addresses here.
+fn fee_on_transfer_denylist() -> &'static [&'static str] {
+    &[]
+}
+
+/// Case-insensitive membership test against a fee-on-transfer denylist.
+fn is_denylisted(token: Address, denylist: &[&str]) -> bool {
+    let t = format!("{token:#x}");
+    denylist.iter().any(|d| d.eq_ignore_ascii_case(&t))
 }
 
 /// Look up a token's decimals from the registry.
 pub fn decimals_of(token: Address, registry: &[TokenInfo]) -> Option<u8> {
     registry.iter().find(|t| t.address == token).map(|t| t.decimals)
+}
+
+/// Read a `usize` tuning knob from the environment, falling back to `default`.
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Read an `f64` tuning knob from the environment, falling back to `default`.
+fn env_f64(key: &str, default: f64) -> f64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Cap the token universe at `max`, ALWAYS keeping every blue-chip (the USD-anchor
+/// backbone) and filling any remaining slots with long-tail tokens in registry
+/// order. Bounds the O(N^2) pair-probe discovery. If `max` is smaller than the
+/// blue-chip count, every blue-chip is still kept (they are never dropped).
+fn cap_tokens(registry: &[TokenInfo], max: usize) -> Vec<TokenInfo> {
+    if registry.len() <= max {
+        return registry.to_vec();
+    }
+    let mut out: Vec<TokenInfo> = registry.iter().filter(|t| t.blue_chip).copied().collect();
+    let remaining = max.saturating_sub(out.len());
+    out.extend(registry.iter().filter(|t| !t.blue_chip).copied().take(remaining));
+    out
+}
+
+/// Resolve the EFFECTIVE decimals for each registry token from on-chain
+/// `decimals()` reads, returning `(effective_tokens, dropped_longtail)`:
+///  - a blue-chip ALWAYS survives with its verified constant (a mismatch or an
+///    unreadable value only warns), so a throttled decimals batch can never drop
+///    a core anchor token — preserving existing behaviour;
+///  - a long-tail token uses its ON-CHAIN decimals (authoritative) and is DROPPED
+///    (fail-closed) when `decimals()` could not be read, so no new token's
+///    decimals is ever assumed.
+fn resolve_effective_tokens(
+    registry: &[TokenInfo],
+    onchain_decimals: &std::collections::HashMap<Address, u8>,
+) -> (Vec<TokenInfo>, Vec<Address>) {
+    let mut effective = Vec::new();
+    let mut dropped = Vec::new();
+    for t in registry {
+        match onchain_decimals.get(&t.address).copied() {
+            Some(d) => {
+                if t.blue_chip {
+                    if d != t.decimals {
+                        warn!(
+                            "Blue-chip {} on-chain decimals {} != registry {}; keeping verified constant",
+                            t.symbol, d, t.decimals
+                        );
+                    }
+                    effective.push(*t);
+                } else {
+                    if d != t.decimals {
+                        debug!(
+                            "Long-tail {} on-chain decimals {} override registry hint {}",
+                            t.symbol, d, t.decimals
+                        );
+                    }
+                    effective.push(TokenInfo { decimals: d, ..*t });
+                }
+            }
+            None => {
+                if t.blue_chip {
+                    warn!(
+                        "Blue-chip {} decimals() unreadable; falling back to verified constant {}",
+                        t.symbol, t.decimals
+                    );
+                    effective.push(*t);
+                } else {
+                    dropped.push(t.address);
+                }
+            }
+        }
+    }
+    (effective, dropped)
+}
+
+/// Keep the `max` deepest items by USD depth (descending). `sort_by` is stable, so
+/// ties preserve input order for deterministic capping. Bounds the pools carried
+/// into cross-tick fetch + edge building.
+fn cap_by_depth<T>(mut items: Vec<(T, f64)>, max: usize) -> Vec<(T, f64)> {
+    items.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    items.truncate(max);
+    items
 }
 
 /// USD-pegged stablecoins in the registry, each valued at $1 as the anchor for
@@ -109,15 +420,94 @@ fn to_human(raw: U256, decimals: u8) -> f64 {
     u256_to_f64(raw) / 10f64.powi(decimals as i32)
 }
 
+/// One pool observation used for USD anchoring: the address-sorted token pair,
+/// the `token1`-per-`token0` human price, and each side's human reserve.
+#[derive(Debug, Clone, Copy)]
+struct PoolObs {
+    token0: Address,
+    token1: Address,
+    price1_per_0: f64,
+    human0: f64,
+    human1: f64,
+}
+
+/// A single USD price quote for a token from one venue, tagged with that venue's
+/// USD depth (used for deepest-venue selection).
+#[derive(Debug, Clone, Copy)]
+struct UsdQuote {
+    price: f64,
+    depth_usd: f64,
+}
+
+/// Median of a non-empty slice of prices.
+fn median_of(values: &[f64]) -> f64 {
+    let mut v: Vec<f64> = values.to_vec();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = v.len();
+    let mid = n / 2;
+    if n % 2 == 1 {
+        v[mid]
+    } else {
+        (v[mid - 1] + v[mid]) / 2.0
+    }
+}
+
+/// Pick a token's USD anchor from multiple venue quotes with a deepest-venue +
+/// median-consensus guard (mirrors the TS `deriveUsdReferenceAnchor`):
+///  1. keep finite, positive prices;
+///  2. require `>= min_venues` valid quotes, else return `None` — a sub-consensus
+///     price is NOT trusted, so the token stays un-priced (fail-closed);
+///  3. when a consensus set survives, drop quotes deviating from the median by
+///     more than `outlier_pct`;
+///  4. among survivors pick the DEEPEST (highest `depth_usd`); ties break toward
+///     the price nearest the median.
+fn anchor_token_usd(quotes: &[UsdQuote], min_venues: usize, outlier_pct: f64) -> Option<f64> {
+    let valid: Vec<UsdQuote> = quotes
+        .iter()
+        .copied()
+        .filter(|q| is_price_plausible(q.price))
+        .collect();
+    if valid.len() < min_venues.max(1) {
+        return None;
+    }
+    let median = median_of(&valid.iter().map(|q| q.price).collect::<Vec<_>>());
+    if median <= 0.0 || !median.is_finite() {
+        return None;
+    }
+    let kept: Vec<UsdQuote> = valid
+        .iter()
+        .copied()
+        .filter(|q| (q.price - median).abs() / median <= outlier_pct / 100.0)
+        .collect();
+    let considered = if kept.is_empty() { &valid } else { &kept };
+    let mut anchor = considered[0];
+    for q in considered.iter().copied() {
+        let deeper = q.depth_usd > anchor.depth_usd;
+        let tie_closer = q.depth_usd == anchor.depth_usd
+            && (q.price - median).abs() < (anchor.price - median).abs();
+        if deeper || tie_closer {
+            anchor = q;
+        }
+    }
+    Some(anchor.price)
+}
+
 /// Derive a live USD price for every token by anchoring stablecoins at $1 and
-/// relaxing outward across the observed edge prices (`token1_per_token0` in
-/// human units). Returns a map keyed by token address.
+/// relaxing outward across pool observations, guarded by a deepest-venue +
+/// median-consensus filter so a single thin/manipulated long-tail pool cannot
+/// poison a token's anchor. A token that cannot gather `>= min_venues`
+/// corroborating quotes is left UN-PRICED (fail-closed); its pools then fail the
+/// USD liquidity gate and are dropped rather than valued on a guessed price.
 ///
-/// For an edge `A -> B` with human price `p` (B per A), `usd(A) = p * usd(B)`.
-/// We iterate until no new token gets priced (bounded by token count).
+/// For a pool with `token1`-per-`token0` human price `p`:
+///   `usd(token0) = p * usd(token1)` and `usd(token1) = usd(token0) / p`.
+/// Each quote's depth is the USD value of the already-priced leg (a balanced-pool
+/// estimate), so the deepest venue wins. Bounded by `tokens.len()` passes.
 fn derive_usd_prices(
     tokens: &[TokenInfo],
-    edges: &[(Address, Address, f64)],
+    pools: &[PoolObs],
+    min_venues: usize,
+    outlier_pct: f64,
 ) -> std::collections::HashMap<Address, f64> {
     use std::collections::HashMap;
     let mut usd: HashMap<Address, f64> = HashMap::new();
@@ -128,17 +518,41 @@ fn derive_usd_prices(
     }
     // Relaxation: at most `tokens.len()` passes guarantees full propagation.
     for _ in 0..tokens.len() {
-        let mut changed = false;
-        for (a, b, price_b_per_a) in edges {
-            if !is_price_plausible(*price_b_per_a) {
+        // Gather every corroborating quote for each not-yet-priced token from the
+        // current snapshot, then anchor with the consensus + depth guard.
+        let mut quotes: HashMap<Address, Vec<UsdQuote>> = HashMap::new();
+        for p in pools {
+            if !is_price_plausible(p.price1_per_0) {
                 continue;
             }
-            if let Some(usd_b) = usd.get(b).copied() {
-                let candidate = price_b_per_a * usd_b;
-                if is_price_plausible(candidate) && !usd.contains_key(a) {
-                    usd.insert(*a, candidate);
-                    changed = true;
+            if let Some(usd1) = usd.get(&p.token1).copied() {
+                if !usd.contains_key(&p.token0) {
+                    let price = p.price1_per_0 * usd1;
+                    if is_price_plausible(price) {
+                        quotes
+                            .entry(p.token0)
+                            .or_default()
+                            .push(UsdQuote { price, depth_usd: p.human1 * usd1 * 2.0 });
+                    }
                 }
+            }
+            if let Some(usd0) = usd.get(&p.token0).copied() {
+                if !usd.contains_key(&p.token1) {
+                    let price = usd0 / p.price1_per_0;
+                    if is_price_plausible(price) {
+                        quotes
+                            .entry(p.token1)
+                            .or_default()
+                            .push(UsdQuote { price, depth_usd: p.human0 * usd0 * 2.0 });
+                    }
+                }
+            }
+        }
+        let mut changed = false;
+        for (token, qs) in &quotes {
+            if let Some(price) = anchor_token_usd(qs, min_venues, outlier_pct) {
+                usd.insert(*token, price);
+                changed = true;
             }
         }
         if !changed {
@@ -213,6 +627,44 @@ fn value_pool_liquidity_usd(
 /// pools produces "no data" rather than a dust-filled mirage graph.
 fn passes_liquidity_gate(liquidity_usd: f64, min_liquidity_usd: f64) -> bool {
     liquidity_usd >= min_liquidity_usd
+}
+
+/// The USD liquidity floor a pool must clear: the blue-chip floor only when BOTH
+/// tokens are curated blue-chips, otherwise the higher long-tail floor (long-tail
+/// prices are easier to manipulate and need more depth to be trusted).
+fn min_liquidity_for_pool(
+    token0: Address,
+    token1: Address,
+    registry: &[TokenInfo],
+    blue_chip_floor: f64,
+    longtail_floor: f64,
+) -> f64 {
+    if is_blue_chip(token0, registry) && is_blue_chip(token1, registry) {
+        blue_chip_floor
+    } else {
+        longtail_floor
+    }
+}
+
+/// V2 reserves-vs-`balanceOf` consistency check (a non-standard-token guard).
+///
+/// A UniswapV2/Sushi pool sets its stored reserves to its real token balances on
+/// every sync, so `balanceOf(pool) >= reserve` holds for a standard ERC-20
+/// (direct donations can only push the balance ABOVE the reserve). A live balance
+/// materially BELOW the stored reserve signals a fee-on-transfer / rebasing /
+/// otherwise non-standard token whose transfer math would fabricate profit, so it
+/// fails closed. `reserve == 0` is treated as consistent (an empty leg is handled
+/// by the liquidity gate, not here).
+fn v2_balance_consistent(reserve_raw: U256, balance_raw: U256, tolerance_pct: f64) -> bool {
+    if reserve_raw.is_zero() {
+        return true;
+    }
+    let reserve = u256_to_f64(reserve_raw);
+    let balance = u256_to_f64(balance_raw);
+    if !reserve.is_finite() || !balance.is_finite() {
+        return false;
+    }
+    balance >= reserve * (1.0 - tolerance_pct / 100.0)
 }
 
 /// Static metadata shared by both directional edges of a pool, including the raw
@@ -526,6 +978,23 @@ fn calldata_balance_of(holder: Address) -> Vec<u8> {
     data
 }
 
+/// `decimals()` takes no arguments, so the calldata is just the 4-byte selector.
+fn calldata_decimals() -> Vec<u8> {
+    SEL_DECIMALS.to_vec()
+}
+
+/// Decode an ERC-20 `decimals()` return (a `uint8` right-aligned in a 32-byte
+/// word). Returns `None` for a malformed/oversized value so an unreadable token
+/// is dropped rather than assigned a guessed decimals.
+fn decode_decimals(bytes: &[u8]) -> Option<u8> {
+    let v = decode_uint256(bytes)?;
+    let raw = v.low_u64();
+    if v > U256::from(MAX_PLAUSIBLE_DECIMALS) || raw > MAX_PLAUSIBLE_DECIMALS {
+        return None;
+    }
+    Some(raw as u8)
+}
+
 /// Decode a single uint256 return word.
 fn decode_uint256(bytes: &[u8]) -> Option<U256> {
     if bytes.len() < 32 {
@@ -632,7 +1101,7 @@ pub async fn fetch_arbitrum_pools(rpc_url: &str) -> eyre::Result<Vec<PoolEdge>> 
 pub async fn fetch_arbitrum_pools_with_usd(
     rpc_url: &str,
 ) -> eyre::Result<(Vec<PoolEdge>, std::collections::HashMap<Address, f64>)> {
-    let (edges, usd_prices, _block) = fetch_arbitrum_pools_with_usd_at_block(rpc_url).await?;
+    let (edges, usd_prices, _block, _tele) = fetch_arbitrum_pools_with_usd_at_block(rpc_url).await?;
     Ok((edges, usd_prices))
 }
 
@@ -642,14 +1111,54 @@ pub async fn fetch_arbitrum_pools_with_usd(
 /// implementation; the two-tuple variant above simply drops the block.
 pub async fn fetch_arbitrum_pools_with_usd_at_block(
     rpc_url: &str,
-) -> eyre::Result<(Vec<PoolEdge>, std::collections::HashMap<Address, f64>, u64)> {
+) -> eyre::Result<(
+    Vec<PoolEdge>,
+    std::collections::HashMap<Address, f64>,
+    u64,
+    DiscoveryTelemetry,
+)> {
     let client = RpcClient::new(rpc_url.to_string(), Duration::from_secs(15), 2)?;
 
     // Liveness check first so failures are clear and early.
     let block = client.block_number().await?;
     info!("Connected to Arbitrum RPC at block {block}");
 
-    let tokens = arbitrum_tokens();
+    // Honest throttle-vs-gate telemetry for this fetch (reporting only; never
+    // influences a gating decision). Populated as the pipeline progresses.
+    let mut tele = DiscoveryTelemetry { block, ..Default::default() };
+
+    // 0) Assemble the EFFECTIVE token universe (Phase 9).
+    //    0a) Cap the registry (blue-chips always kept) to bound O(N^2) discovery.
+    //    0b) Read ERC-20 decimals() ON-CHAIN for every token; blue-chips fall back
+    //        to their verified constant, long-tail tokens with unreadable decimals
+    //        are DROPPED (fail-closed — a new token's decimals is never assumed).
+    //    0c) Drop any denylisted (known non-standard) token unconditionally.
+    let registry_all = arbitrum_tokens();
+    let max_tokens = env_usize("SCANNER_MAX_TOKENS", DEFAULT_MAX_TOKENS);
+    let registry_capped = cap_tokens(&registry_all, max_tokens);
+    let capped_addrs: Vec<Address> = registry_capped.iter().map(|t| t.address).collect();
+    let onchain_decimals = read_onchain_decimals(&client, &capped_addrs).await;
+    let (mut tokens, dropped_no_decimals) =
+        resolve_effective_tokens(&registry_capped, &onchain_decimals);
+    let denylist = fee_on_transfer_denylist();
+    let before_denylist = tokens.len();
+    tokens.retain(|t| !is_denylisted(t.address, denylist));
+    tele.registry_tokens = registry_all.len();
+    tele.tokens_loaded = tokens.len();
+    tele.bluechip_loaded = tokens.iter().filter(|t| t.blue_chip).count();
+    tele.longtail_loaded = tokens.iter().filter(|t| !t.blue_chip).count();
+    tele.tokens_dropped_no_decimals = dropped_no_decimals.len();
+    tele.tokens_dropped_denylist = before_denylist - tokens.len();
+    info!(
+        "Token universe: {} effective ({} blue-chip + {} long-tail) from {} registered; \
+         dropped {} long-tail with unreadable on-chain decimals (fail-closed), cap={}",
+        tokens.len(),
+        tokens.iter().filter(|t| t.blue_chip).count(),
+        tokens.iter().filter(|t| !t.blue_chip).count(),
+        registry_all.len(),
+        dropped_no_decimals.len(),
+        max_tokens
+    );
     let v3_factory = addr(UNISWAP_V3_FACTORY);
     let sushi_factory = addr(SUSHISWAP_V2_FACTORY);
 
@@ -699,6 +1208,16 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
         .collect();
 
     let (discovery_results, discovery_failed) = batch_in_chunks(&client, &discovery_calls, 40).await;
+    tele.discovery_probes = discovery_calls.len();
+    tele.discovery_probes_failed = discovery_failed;
+    if !discovery_calls.is_empty() {
+        info!(
+            "Discovery batch: {}/{} probe call(s) failed ({:.1}%)",
+            discovery_failed,
+            discovery_calls.len(),
+            tele.discovery_fail_pct()
+        );
+    }
     if !discovery_calls.is_empty()
         && discovery_failed as f64 / discovery_calls.len() as f64 > MAX_BATCH_FAILURE_FRACTION
     {
@@ -720,6 +1239,7 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
             }
         }
     }
+    tele.pools_discovered = pools.len();
     info!(
         "Discovered {} live pools out of {} probed pair/venue combinations",
         pools.len(),
@@ -766,6 +1286,16 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
     }
 
     let (state_results, state_failed) = batch_in_chunks(&client, &state_calls, 60).await;
+    tele.state_calls = state_calls.len();
+    tele.state_calls_failed = state_failed;
+    if !state_calls.is_empty() {
+        info!(
+            "State batch: {}/{} state/balance call(s) failed ({:.1}%)",
+            state_failed,
+            state_calls.len(),
+            tele.state_fail_pct()
+        );
+    }
     if !state_calls.is_empty()
         && state_failed as f64 / state_calls.len() as f64 > MAX_BATCH_FAILURE_FRACTION
     {
@@ -807,8 +1337,20 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
         }
     }
 
+    // Phase 9 tuning knobs (env-overridable), read once.
+    let blue_chip_floor = env_f64("SCANNER_MIN_POOL_LIQUIDITY_USD", DEFAULT_MIN_POOL_LIQUIDITY_USD);
+    let longtail_floor =
+        env_f64("SCANNER_MIN_LONGTAIL_POOL_LIQUIDITY_USD", DEFAULT_MIN_LONGTAIL_POOL_LIQUIDITY_USD);
+    let max_pools = env_usize("SCANNER_MAX_POOLS", DEFAULT_MAX_POOLS);
+    let min_anchor_venues = env_usize("SCANNER_MIN_ANCHOR_VENUES", DEFAULT_MIN_ANCHOR_VENUES);
+    let anchor_outlier_pct = env_f64("SCANNER_ANCHOR_OUTLIER_PCT", DEFAULT_ANCHOR_OUTLIER_PCT);
+    let v2_balance_tol =
+        env_f64("SCANNER_V2_BALANCE_TOLERANCE_PCT", DEFAULT_V2_BALANCE_TOLERANCE_PCT);
+
     // 4) Compute each pool's `token1_per_token0` price + human reserves + the raw
     //    integer swap state (V2 reserves / V3 sqrtPrice+L+tick) the simulator needs.
+    //    Cross-tick data is fetched later (after the liquidity gate + pool cap) so
+    //    that RPC is spent only on pools that actually survive.
     struct PricedPool {
         candidate: PoolCandidate,
         pool_addr: Address,
@@ -822,12 +1364,16 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
         sqrt_price_x96: U256,
         liquidity: u128,
         tick: i32,
-        /// V3 cross-tick data (initialized ticks + fetched window); `None` for V2.
-        cross_tick: Option<V3CrossTickData>,
     }
+    // (d) Tokens flagged non-standard by the V2 reserves-vs-balanceOf check; every
+    //     pool touching one is dropped after this pass (fail-closed).
+    let mut nonstandard: std::collections::HashSet<Address> = std::collections::HashSet::new();
     let mut priced: Vec<PricedPool> = Vec::new();
     for (idx, (candidate, pool_addr)) in pools.iter().enumerate() {
-        let Some(bytes) = price_bytes.get(&idx) else { continue };
+        let Some(bytes) = price_bytes.get(&idx) else {
+            tele.pools_dropped_incomplete_state += 1;
+            continue;
+        };
         let mut reserve0 = U256::zero();
         let mut reserve1 = U256::zero();
         let mut sqrt_price_x96 = U256::zero();
@@ -840,6 +1386,7 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
                     // missing liquidity() read must NOT be treated as zero and let
                     // through, so require it to have decoded.
                     let Some(l) = v3_liquidity.get(&idx).copied() else {
+                        tele.pools_dropped_incomplete_state += 1;
                         debug!(
                             "Skipping {} pool {:#x}/{:#x}: missing liquidity() result (degraded RPC)",
                             candidate.dex, candidate.token0, candidate.token1
@@ -851,7 +1398,10 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
                     tick = tk;
                     v3_price_token1_per_token0(sqrt, candidate.dec0, candidate.dec1)
                 }
-                None => continue,
+                None => {
+                    tele.pools_dropped_bad_price += 1;
+                    continue;
+                }
             }
         } else {
             match decode_reserves(bytes) {
@@ -860,10 +1410,14 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
                     reserve1 = r1;
                     v2_price_token1_per_token0(r0, r1, candidate.dec0, candidate.dec1)
                 }
-                None => continue,
+                None => {
+                    tele.pools_dropped_bad_price += 1;
+                    continue;
+                }
             }
         };
         if !is_price_plausible(price1_per_0) {
+            tele.pools_dropped_bad_price += 1;
             warn!(
                 "Skipping {} pool {:#x}/{:#x}: implausible price {price1_per_0:e} (decimals/ordering guard)",
                 candidate.dex, candidate.token0, candidate.token1
@@ -874,6 +1428,7 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
         // degraded RPC must NOT be silently treated as a zero reserve — skip the
         // pool so it can never be valued (and emitted) from partial data.
         let (Some(raw0), Some(raw1)) = (bal0.get(&idx), bal1.get(&idx)) else {
+            tele.pools_dropped_incomplete_state += 1;
             debug!(
                 "Skipping {} pool {:#x}/{:#x}: missing balanceOf result(s) (degraded RPC)",
                 candidate.dex, candidate.token0, candidate.token1
@@ -882,6 +1437,20 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
         };
         let human0 = to_human(*raw0, candidate.dec0);
         let human1 = to_human(*raw1, candidate.dec1);
+        // (d) NON-STANDARD TOKEN GUARD (V2 only): a UniswapV2/Sushi pool syncs its
+        //     stored reserves to its real balances, so a live balanceOf materially
+        //     BELOW the stored reserve signals a fee-on-transfer / rebasing token
+        //     whose transfer math would fabricate profit. Flag it; every pool
+        //     touching it is dropped below. V3 has no comparable stored reserve, so
+        //     those tokens rely on the denylist + consensus-anchor gate instead.
+        if !candidate.is_v3 {
+            if !v2_balance_consistent(reserve0, *raw0, v2_balance_tol) {
+                nonstandard.insert(candidate.token0);
+            }
+            if !v2_balance_consistent(reserve1, *raw1, v2_balance_tol) {
+                nonstandard.insert(candidate.token1);
+            }
+        }
         priced.push(PricedPool {
             candidate: candidate.clone(),
             pool_addr: *pool_addr,
@@ -893,68 +1462,64 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
             sqrt_price_x96,
             liquidity,
             tick,
-            cross_tick: None,
         });
     }
 
-    // 4.5) Fetch bounded V3 cross-tick data so the simulator can walk swaps across
-    //      initialized-tick boundaries (Phase 8) instead of fail-closing on them.
-    //      Fail-closed: any pool without complete, in-bounds data keeps `None` and
-    //      is simulated exactly within its current interval (Phase-4 behaviour).
-    let v3_refs: Vec<Option<V3PoolRef>> = priced
+    // (d) Drop every pool touching a non-standard token (including its V3 pools).
+    if !nonstandard.is_empty() {
+        let before = priced.len();
+        priced.retain(|p| {
+            !nonstandard.contains(&p.candidate.token0)
+                && !nonstandard.contains(&p.candidate.token1)
+        });
+        tele.pools_dropped_nonstandard = before - priced.len();
+        info!(
+            "Dropped {} pool(s) touching {} non-standard token(s) (V2 reserves-vs-balanceOf divergence > {:.2}%)",
+            before - priced.len(),
+            nonstandard.len(),
+            v2_balance_tol
+        );
+    }
+
+    // 5) Derive live USD prices with a deepest-venue + median-consensus anchor
+    //    (Phase 9). A token that cannot gather >= min_anchor_venues corroborating
+    //    quotes within the outlier band is left UN-PRICED, so its pools fail the
+    //    USD liquidity gate below and are dropped rather than valued on a guess.
+    let pool_obs: Vec<PoolObs> = priced
         .iter()
-        .map(|p| {
-            if p.candidate.is_v3 {
-                Some(V3PoolRef { pool_addr: p.pool_addr, fee: p.candidate.fee, tick: p.tick })
-            } else {
-                None
-            }
+        .map(|p| PoolObs {
+            token0: p.candidate.token0,
+            token1: p.candidate.token1,
+            price1_per_0: p.price1_per_0,
+            human0: p.human0,
+            human1: p.human1,
         })
         .collect();
-    let cross_tick_data = fetch_cross_tick_data(&client, &v3_refs).await;
-    let cross_tick_pools = cross_tick_data.iter().filter(|c| c.is_some()).count();
-    for (p, ct) in priced.iter_mut().zip(cross_tick_data) {
-        p.cross_tick = ct;
-    }
-    info!(
-        "Fetched V3 cross-tick data for {}/{} V3 pools (others fall back to within-interval sim)",
-        cross_tick_pools,
-        v3_refs.iter().filter(|r| r.is_some()).count()
-    );
+    let usd_prices = derive_usd_prices(&tokens, &pool_obs, min_anchor_venues, anchor_outlier_pct);
 
-    // 5) Derive live USD prices for every token from stablecoin anchors, using
-    //    the observed edge prices (both directions).
-    let mut price_edges: Vec<(Address, Address, f64)> = Vec::new();
-    for p in &priced {
-        price_edges.push((p.candidate.token0, p.candidate.token1, p.price1_per_0));
-        price_edges.push((p.candidate.token1, p.candidate.token0, 1.0 / p.price1_per_0));
-    }
-    let usd_prices = derive_usd_prices(&tokens, &price_edges);
-
-    let min_liquidity_usd = std::env::var("SCANNER_MIN_POOL_LIQUIDITY_USD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_MIN_POOL_LIQUIDITY_USD);
-
-    // 6) Build bidirectional edges, valuing liquidity and skipping dust pools.
-    let mut edges: Vec<PoolEdge> = Vec::new();
-    let mut priced_pools = 0usize;
+    // 6) Liquidity gate: value each pool in USD and keep only those at or above the
+    //    applicable floor — the higher long-tail floor for any pool touching a
+    //    non-blue-chip token, the blue-chip floor for blue-chip-only pools. NaN
+    //    (no USD-anchored leg) and sub-threshold values both fail closed, so a
+    //    degraded RPC or an un-priceable long-tail token cannot surface a mirage.
+    let mut passing: Vec<(usize, f64)> = Vec::new();
     let mut skipped_dust = 0usize;
     let mut unpriced_liquidity = 0usize;
-    for p in &priced {
+    for (idx, p) in priced.iter().enumerate() {
         let usd0 = usd_prices.get(&p.candidate.token0).copied();
         let usd1 = usd_prices.get(&p.candidate.token1).copied();
         if usd0.is_none() && usd1.is_none() {
             unpriced_liquidity += 1;
         }
-        // Liquidity in USD from whichever legs we can value; NaN when neither
-        // leg is USD-anchored (cannot value -> must fail closed below).
         let liquidity_usd = value_pool_liquidity_usd(usd0, usd1, p.human0, p.human1);
-
-        // FAIL CLOSED: skip anything not provably at or above the floor. NaN
-        // (unvaluable / no USD-anchored leg) and any sub-threshold value are
-        // both excluded, so a degraded RPC cannot let dust/mirage pools through.
-        if !passes_liquidity_gate(liquidity_usd, min_liquidity_usd) {
+        let floor = min_liquidity_for_pool(
+            p.candidate.token0,
+            p.candidate.token1,
+            &tokens,
+            blue_chip_floor,
+            longtail_floor,
+        );
+        if !passes_liquidity_gate(liquidity_usd, floor) {
             skipped_dust += 1;
             debug!(
                 "Skipping {} pool {:#x}/{:#x}: liquidity {} not >= ${:.0} (fail-closed)",
@@ -966,17 +1531,62 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
                 } else {
                     "unvaluable".to_string()
                 },
-                min_liquidity_usd
+                floor
             );
             continue;
         }
+        passing.push((idx, liquidity_usd));
+    }
+    tele.pools_dropped_liquidity = skipped_dust;
+    tele.pools_unpriced_leg = unpriced_liquidity;
 
+    // 6b) Cap to the deepest SCANNER_MAX_POOLS pools to bound edge/cross-tick RPC.
+    let before_cap = passing.len();
+    let passing = cap_by_depth(passing, max_pools);
+    tele.pools_capped = before_cap - passing.len();
+    if passing.len() < before_cap {
+        info!(
+            "Capped pool set {} -> {} (kept deepest by USD liquidity, SCANNER_MAX_POOLS={})",
+            before_cap,
+            passing.len(),
+            max_pools
+        );
+    }
+
+    // 6c) Fetch bounded V3 cross-tick data (Phase 8) for the SURVIVING pools only,
+    //     so that RPC is spent only on pools that will build edges. Any pool
+    //     without complete, in-bounds data keeps `None` and is simulated exactly
+    //     within its current interval (fail-closed — never a guess).
+    let v3_refs: Vec<Option<V3PoolRef>> = passing
+        .iter()
+        .map(|(idx, _)| {
+            let p = &priced[*idx];
+            if p.candidate.is_v3 {
+                Some(V3PoolRef { pool_addr: p.pool_addr, fee: p.candidate.fee, tick: p.tick })
+            } else {
+                None
+            }
+        })
+        .collect();
+    let cross_tick_data = fetch_cross_tick_data(&client, &v3_refs).await;
+    let cross_tick_pools = cross_tick_data.iter().filter(|c| c.is_some()).count();
+    info!(
+        "Fetched V3 cross-tick data for {}/{} surviving V3 pools (others fall back to within-interval sim)",
+        cross_tick_pools,
+        v3_refs.iter().filter(|r| r.is_some()).count()
+    );
+
+    // 6d) Build bidirectional edges for the surviving, capped pools.
+    let mut edges: Vec<PoolEdge> = Vec::new();
+    let mut priced_pools = 0usize;
+    for ((idx, liquidity_usd), cross_tick) in passing.iter().zip(cross_tick_data) {
+        let p = &priced[*idx];
         if let Some(pair) = build_bidirectional_edges(
             p.candidate.token0,
             p.candidate.token1,
             p.price1_per_0,
             &EdgeMeta {
-                liquidity_usd,
+                liquidity_usd: *liquidity_usd,
                 dex: &p.candidate.dex,
                 is_v3: p.candidate.is_v3,
                 fee: p.candidate.fee,
@@ -988,7 +1598,7 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
                 sqrt_price_x96: p.sqrt_price_x96,
                 liquidity: p.liquidity,
                 tick: p.tick,
-                cross_tick: p.cross_tick.clone(),
+                cross_tick,
             },
         ) {
             priced_pools += 1;
@@ -997,15 +1607,40 @@ pub async fn fetch_arbitrum_pools_with_usd_at_block(
     }
 
     info!(
-        "Built {} directional edges from {} pools (fail-closed: skipped {} dust/unvaluable pools not >= ${:.0}; {} of those had no USD-anchored leg)",
+        "Built {} directional edges from {} pools (fail-closed: skipped {} dust/unvaluable pools; \
+         {} had no USD-anchored leg; blue-chip floor ${:.0}, long-tail floor ${:.0})",
         edges.len(),
         priced_pools,
         skipped_dust,
-        min_liquidity_usd,
-        unpriced_liquidity
+        unpriced_liquidity,
+        blue_chip_floor,
+        longtail_floor
+    );
+    tele.pools_kept = priced_pools;
+    tele.edges_loaded = edges.len();
+    info!(
+        "Discovery telemetry @ block {}: tokens_loaded={} edges_loaded={} | throttle_drops={} \
+         (discovery_failed={}/{} state_failed={}/{} incomplete_state={}) | gate_drops={} \
+         (no_decimals={} denylist={} bad_price={} nonstandard={} liquidity={}) | throttle_suspected={}",
+        tele.block,
+        tele.tokens_loaded,
+        tele.edges_loaded,
+        tele.throttle_drops(),
+        tele.discovery_probes_failed,
+        tele.discovery_probes,
+        tele.state_calls_failed,
+        tele.state_calls,
+        tele.pools_dropped_incomplete_state,
+        tele.gate_drops(),
+        tele.tokens_dropped_no_decimals,
+        tele.tokens_dropped_denylist,
+        tele.pools_dropped_bad_price,
+        tele.pools_dropped_nonstandard,
+        tele.pools_dropped_liquidity,
+        tele.throttle_suspected()
     );
 
-    Ok((edges, usd_prices, block))
+    Ok((edges, usd_prices, block, tele))
 }
 
 /// Split a large set of calls into fixed-size batches to stay friendly with
@@ -1033,6 +1668,34 @@ async fn batch_in_chunks(
         }
     }
     (out, failed_calls)
+}
+
+/// Read ERC-20 `decimals()` ON-CHAIN for every token (batched). Returns
+/// `address -> decimals` only for tokens whose value decoded to a plausible
+/// number; a token absent from the map could not be read this run. Fail-closed by
+/// OMISSION: the caller drops any long-tail token missing here rather than
+/// assuming its decimals, while a blue-chip falls back to its verified constant.
+/// A degraded/throttled batch therefore shrinks the long-tail toward the safe
+/// blue-chip baseline instead of fabricating decimals.
+async fn read_onchain_decimals(
+    client: &RpcClient,
+    tokens: &[Address],
+) -> std::collections::HashMap<Address, u8> {
+    let calls: Vec<Call> = tokens
+        .iter()
+        .enumerate()
+        .map(|(idx, address)| Call { key: idx, to: *address, data: calldata_decimals() })
+        .collect();
+    let (results, _failed) = batch_in_chunks(client, &calls, 60).await;
+    let mut out = std::collections::HashMap::new();
+    for (key, bytes) in results {
+        if let Some(d) = decode_decimals(&bytes) {
+            if let Some(address) = tokens.get(key) {
+                out.insert(*address, d);
+            }
+        }
+    }
+    out
 }
 
 /// Phase 8 cross-tick fetch bounds. We read `2*V3_WORD_RADIUS+1` tick-bitmap words
@@ -1360,8 +2023,8 @@ mod tests {
 
     #[test]
     fn sorted_pair_orders_by_address() {
-        let a = TokenInfo { symbol: "A", address: addr("0x0000000000000000000000000000000000000002"), decimals: 18 };
-        let b = TokenInfo { symbol: "B", address: addr("0x0000000000000000000000000000000000000001"), decimals: 6 };
+        let a = TokenInfo { symbol: "A", address: addr("0x0000000000000000000000000000000000000002"), decimals: 18, blue_chip: false };
+        let b = TokenInfo { symbol: "B", address: addr("0x0000000000000000000000000000000000000001"), decimals: 6, blue_chip: false };
         let (t0, t1) = sorted_pair(a, b);
         assert_eq!(t0.symbol, "B");
         assert_eq!(t1.symbol, "A");
@@ -1379,21 +2042,21 @@ mod tests {
 
     #[test]
     fn derive_usd_prices_propagates_from_stables() {
-        let weth = TokenInfo { symbol: "WETH", address: addr("0x0000000000000000000000000000000000000010"), decimals: 18 };
-        let usdc = TokenInfo { symbol: "USDC", address: addr("0x0000000000000000000000000000000000000020"), decimals: 6 };
-        let arb = TokenInfo { symbol: "ARB", address: addr("0x0000000000000000000000000000000000000030"), decimals: 18 };
+        let weth = TokenInfo { symbol: "WETH", address: addr("0x0000000000000000000000000000000000000010"), decimals: 18, blue_chip: true };
+        let usdc = TokenInfo { symbol: "USDC", address: addr("0x0000000000000000000000000000000000000020"), decimals: 6, blue_chip: true };
+        let arb = TokenInfo { symbol: "ARB", address: addr("0x0000000000000000000000000000000000000030"), decimals: 18, blue_chip: true };
         let tokens = vec![weth, usdc, arb];
 
-        // Edge prices are token_out per token_in (human units):
-        //   WETH -> USDC at 3000 USDC/WETH  => usd(WETH) = 3000 * 1 = 3000
-        //   ARB  -> WETH at 0.0005 WETH/ARB => usd(ARB)  = 0.0005 * 3000 = 1.5
-        let edges = vec![
-            (weth.address, usdc.address, 3000.0),
-            (usdc.address, weth.address, 1.0 / 3000.0),
-            (arb.address, weth.address, 0.0005),
-            (weth.address, arb.address, 1.0 / 0.0005),
+        // Address-sorted pools (token1-per-token0 human price):
+        //   WETH/USDC: 3000 USDC per WETH  => usd(WETH) = 3000 * 1     = 3000
+        //   WETH/ARB : 2000 ARB  per WETH  => usd(ARB)  = 3000 / 2000  = 1.5
+        // min_venues = 1 here isolates the propagation math; the consensus/outlier
+        // behaviour is covered by its own tests below.
+        let pools = vec![
+            PoolObs { token0: weth.address, token1: usdc.address, price1_per_0: 3000.0, human0: 10.0, human1: 30_000.0 },
+            PoolObs { token0: weth.address, token1: arb.address, price1_per_0: 2000.0, human0: 10.0, human1: 20_000.0 },
         ];
-        let usd = derive_usd_prices(&tokens, &edges);
+        let usd = derive_usd_prices(&tokens, &pools, 1, 100.0);
         assert!((usd[&usdc.address] - 1.0).abs() < 1e-9);
         assert!((usd[&weth.address] - 3000.0).abs() < 1e-6, "got {}", usd[&weth.address]);
         assert!((usd[&arb.address] - 1.5).abs() < 1e-6, "got {}", usd[&arb.address]);
@@ -1407,6 +2070,27 @@ mod tests {
         assert!(is_stable("DAI"));
         assert!(!is_stable("WETH"));
         assert!(!is_stable("WBTC"));
+    }
+
+    #[test]
+    fn only_four_canonical_stables_are_hard_pinned() {
+        // Phase 9 honesty invariant: NO new $1 pin. Only the four canonical
+        // stablecoins are anchored at $1; every other token — including real
+        // long-tail stables that can depeg (FRAX/LUSD/MIM/USDS) — must be priced
+        // via the consensus anchor, never hard-pinned.
+        assert_eq!(stable_symbols().len(), 4);
+        for depeggable in ["FRAX", "LUSD", "MIM", "USDS"] {
+            assert!(
+                !is_stable(depeggable),
+                "{depeggable} must NOT be hard-pinned to $1 (it can depeg; price it via consensus)"
+            );
+        }
+        // And these long-tail stables really are in the registry (so the guard matters).
+        let syms: std::collections::HashSet<&str> =
+            arbitrum_tokens().iter().map(|t| t.symbol).collect();
+        for depeggable in ["FRAX", "LUSD", "MIM", "USDS"] {
+            assert!(syms.contains(depeggable), "{depeggable} should be a registered long-tail token");
+        }
     }
 
     #[test]
@@ -1547,5 +2231,335 @@ mod tests {
         // Near the min tick the window clamps rather than underflowing.
         let plan = cross_tick_plan(V3_MIN_TICK + 1, 200);
         assert_eq!(plan.window.0, V3_MIN_TICK);
+    }
+
+    // ================= Phase 9: long-tail universe expansion =================
+
+    // ---- (b) per-pool liquidity floor selection ----
+    #[test]
+    fn longtail_floor_applies_when_any_leg_is_longtail() {
+        let bc0 = TokenInfo { symbol: "WETH", address: addr("0x0000000000000000000000000000000000000a01"), decimals: 18, blue_chip: true };
+        let bc1 = TokenInfo { symbol: "USDC", address: addr("0x0000000000000000000000000000000000000a02"), decimals: 6, blue_chip: true };
+        let lt = TokenInfo { symbol: "LONG", address: addr("0x0000000000000000000000000000000000000a03"), decimals: 18, blue_chip: false };
+        let registry = vec![bc0, bc1, lt];
+        // Blue-chip-only pool -> blue-chip floor.
+        assert_eq!(
+            min_liquidity_for_pool(bc0.address, bc1.address, &registry, 5_000.0, 25_000.0),
+            5_000.0
+        );
+        // Any long-tail leg -> the higher long-tail floor.
+        assert_eq!(
+            min_liquidity_for_pool(bc0.address, lt.address, &registry, 5_000.0, 25_000.0),
+            25_000.0
+        );
+        // A token absent from the registry is treated as non-blue-chip (long-tail).
+        let unknown = addr("0x0000000000000000000000000000000000000a99");
+        assert_eq!(
+            min_liquidity_for_pool(bc0.address, unknown, &registry, 5_000.0, 25_000.0),
+            25_000.0
+        );
+    }
+
+    #[test]
+    fn longtail_pool_below_its_higher_floor_is_dropped() {
+        // A $10k pool clears the $5k blue-chip floor but NOT the $25k long-tail floor.
+        let liq = 10_000.0;
+        assert!(passes_liquidity_gate(liq, DEFAULT_MIN_POOL_LIQUIDITY_USD));
+        assert!(!passes_liquidity_gate(liq, DEFAULT_MIN_LONGTAIL_POOL_LIQUIDITY_USD));
+    }
+
+    // ---- (c) consensus + depth USD anchoring ----
+    fn q(price: f64, depth_usd: f64) -> UsdQuote {
+        UsdQuote { price, depth_usd }
+    }
+
+    #[test]
+    fn anchor_requires_min_venues() {
+        // A single un-corroborated quote is NOT trusted (fail-closed).
+        assert_eq!(anchor_token_usd(&[q(10.0, 1_000.0)], 2, 3.0), None);
+        // Two agreeing quotes anchor.
+        assert_eq!(anchor_token_usd(&[q(10.0, 1_000.0), q(10.0, 500.0)], 2, 3.0), Some(10.0));
+    }
+
+    #[test]
+    fn anchor_rejects_outlier_then_picks_deepest() {
+        // Median = 10.1; the 50.0 quote is a >3% outlier and is dropped BEFORE depth
+        // selection, even though it is the deepest — proving an outlier cannot win.
+        let anchor = anchor_token_usd(&[q(10.0, 100.0), q(10.1, 90.0), q(50.0, 1_000.0)], 2, 3.0);
+        assert_eq!(anchor, Some(10.0), "deepest in-consensus quote wins, outlier rejected");
+    }
+
+    #[test]
+    fn derive_usd_prices_drops_uncorroborated_token() {
+        let usdc = TokenInfo { symbol: "USDC", address: addr("0x0000000000000000000000000000000000000b01"), decimals: 6, blue_chip: true };
+        let x = TokenInfo { symbol: "X", address: addr("0x0000000000000000000000000000000000000b02"), decimals: 18, blue_chip: false };
+        let y = TokenInfo { symbol: "Y", address: addr("0x0000000000000000000000000000000000000b03"), decimals: 18, blue_chip: false };
+        let tokens = vec![usdc, x, y];
+        // token0 = USDC (its address sorts first). price1_per_0 = tokenX-per-USDC, so
+        // usd(X) = usd(USDC)/price1_per_0. X: two deep/correct pools at $10 plus one
+        // thin outlier at $20 (rejected). Y: only ONE pool -> below min_venues.
+        let pools = vec![
+            PoolObs { token0: usdc.address, token1: x.address, price1_per_0: 0.1, human0: 100_000.0, human1: 10_000.0 },
+            PoolObs { token0: usdc.address, token1: x.address, price1_per_0: 0.1, human0: 50_000.0, human1: 5_000.0 },
+            PoolObs { token0: usdc.address, token1: x.address, price1_per_0: 0.05, human0: 1_000.0, human1: 50.0 },
+            PoolObs { token0: usdc.address, token1: y.address, price1_per_0: 0.2, human0: 40_000.0, human1: 8_000.0 },
+        ];
+        let usd = derive_usd_prices(&tokens, &pools, 2, 3.0);
+        assert!((usd[&usdc.address] - 1.0).abs() < 1e-12);
+        assert!(
+            (usd[&x.address] - 10.0).abs() < 1e-9,
+            "X anchored to consensus $10, got {:?}",
+            usd.get(&x.address)
+        );
+        assert!(
+            !usd.contains_key(&y.address),
+            "Y had < 2 corroborating venues and must stay un-priced (fail-closed drop)"
+        );
+    }
+
+    // ---- (a) on-chain decimals ----
+    fn word_u64(v: u64) -> Vec<u8> {
+        let mut w = vec![0u8; 32];
+        w[24..32].copy_from_slice(&v.to_be_bytes());
+        w
+    }
+
+    #[test]
+    fn decode_decimals_accepts_plausible_rejects_garbage() {
+        assert_eq!(decode_decimals(&word_u64(18)), Some(18));
+        assert_eq!(decode_decimals(&word_u64(6)), Some(6));
+        assert_eq!(decode_decimals(&word_u64(0)), Some(0));
+        assert_eq!(decode_decimals(&word_u64(36)), Some(36)); // boundary kept
+        assert_eq!(decode_decimals(&word_u64(37)), None, "above MAX_PLAUSIBLE_DECIMALS -> dropped");
+        assert_eq!(decode_decimals(&[]), None, "empty return -> fail closed");
+        assert_eq!(decode_decimals(&[0u8; 10]), None, "short return -> fail closed");
+        // A huge value in the high bytes is rejected too.
+        let mut huge = vec![0u8; 32];
+        huge[0] = 0x01;
+        assert_eq!(decode_decimals(&huge), None);
+    }
+
+    #[test]
+    fn resolve_effective_tokens_drops_unreadable_longtail_keeps_bluechip() {
+        let bc = TokenInfo { symbol: "USDC", address: addr("0x0000000000000000000000000000000000000c01"), decimals: 6, blue_chip: true };
+        let lt = TokenInfo { symbol: "LT", address: addr("0x0000000000000000000000000000000000000c02"), decimals: 18, blue_chip: false };
+        let lt2 = TokenInfo { symbol: "LT2", address: addr("0x0000000000000000000000000000000000000c03"), decimals: 18, blue_chip: false };
+        let registry = vec![bc, lt, lt2];
+        let mut onchain = std::collections::HashMap::new();
+        onchain.insert(bc.address, 8u8); // deliberate mismatch: blue-chip keeps verified 6
+        onchain.insert(lt.address, 6u8); // long-tail: on-chain overrides the 18 hint
+        // lt2 absent -> unreadable -> dropped (fail-closed).
+        let (effective, dropped) = resolve_effective_tokens(&registry, &onchain);
+        assert_eq!(effective.len(), 2);
+        let dec = |a: Address| effective.iter().find(|t| t.address == a).map(|t| t.decimals);
+        assert_eq!(dec(bc.address), Some(6), "blue-chip keeps verified constant despite on-chain mismatch");
+        assert_eq!(dec(lt.address), Some(6), "long-tail uses authoritative on-chain decimals");
+        assert_eq!(dropped, vec![lt2.address]);
+    }
+
+    #[test]
+    fn resolve_effective_tokens_bluechip_survives_unreadable() {
+        // A throttled decimals batch (no entries) must NOT drop a blue-chip.
+        let bc = TokenInfo { symbol: "WETH", address: addr("0x0000000000000000000000000000000000000c10"), decimals: 18, blue_chip: true };
+        let registry = vec![bc];
+        let (effective, dropped) =
+            resolve_effective_tokens(&registry, &std::collections::HashMap::new());
+        assert_eq!(effective.len(), 1);
+        assert_eq!(effective[0].decimals, 18);
+        assert!(dropped.is_empty());
+    }
+
+    // ---- (d) non-standard token guards ----
+    #[test]
+    fn v2_balance_below_reserve_flags_nonstandard() {
+        let reserve = U256::from(1_000_000u64);
+        // Within tolerance (0.5% below) -> consistent (standard token).
+        assert!(v2_balance_consistent(reserve, U256::from(995_000u64), 1.0));
+        // Exactly at reserve -> consistent.
+        assert!(v2_balance_consistent(reserve, reserve, 1.0));
+        // Donation ABOVE reserve -> consistent (balance can only exceed reserve).
+        assert!(v2_balance_consistent(reserve, U256::from(2_000_000u64), 1.0));
+        // Materially BELOW reserve (2% short) -> NON-standard (flagged, dropped).
+        assert!(!v2_balance_consistent(reserve, U256::from(980_000u64), 1.0));
+        // Empty reserve is handled by the liquidity gate; treated consistent here.
+        assert!(v2_balance_consistent(U256::zero(), U256::zero(), 1.0));
+    }
+
+    #[test]
+    fn denylist_membership_is_case_insensitive() {
+        let a = addr("0x00000000000000000000000000000000000000aa");
+        let denylist = ["0x00000000000000000000000000000000000000AA"];
+        assert!(is_denylisted(a, &denylist));
+        let b = addr("0x00000000000000000000000000000000000000bb");
+        assert!(!is_denylisted(b, &denylist));
+        // The production denylist is intentionally empty (curated registry is clean).
+        assert!(fee_on_transfer_denylist().is_empty());
+    }
+
+    // ---- (f) blue-chip preservation ----
+    #[test]
+    fn all_eleven_bluechips_preserved() {
+        let t = arbitrum_tokens();
+        let blue: Vec<_> = t.iter().filter(|x| x.blue_chip).collect();
+        assert_eq!(blue.len(), 11, "the 11 curated blue-chips must be preserved");
+        for sym in ["WETH", "USDC", "USDCe", "USDT", "ARB", "WBTC", "GMX", "PENDLE", "MAGIC", "RDNT", "DAI"] {
+            let tok = t
+                .iter()
+                .find(|x| x.symbol == sym)
+                .unwrap_or_else(|| panic!("missing blue-chip {sym}"));
+            assert!(tok.blue_chip, "{sym} must be flagged blue_chip");
+            assert!(is_blue_chip(tok.address, &t), "{sym} must pass is_blue_chip");
+        }
+        // Canonical addresses locked so a future edit cannot silently swap them.
+        assert_eq!(
+            t.iter().find(|x| x.symbol == "WETH").unwrap().address,
+            addr("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1")
+        );
+        assert_eq!(
+            t.iter().find(|x| x.symbol == "USDC").unwrap().address,
+            addr("0xaf88d065e77c8cC2239327C5EDb3A432268e5831")
+        );
+        // The long-tail set was actually added and is NOT flagged blue-chip.
+        let longtail: Vec<_> = t.iter().filter(|x| !x.blue_chip).collect();
+        assert!(longtail.len() >= 20, "Phase 9 must add a real long-tail set");
+        let link = t.iter().find(|x| x.symbol == "LINK").unwrap();
+        assert!(!is_blue_chip(link.address, &t), "LINK is long-tail, not blue-chip");
+    }
+
+    #[test]
+    fn registry_addresses_are_unique() {
+        // Guards against a copy-paste dup that would double-probe / double-count.
+        let t = arbitrum_tokens();
+        let mut seen = std::collections::HashSet::new();
+        for tok in &t {
+            assert!(seen.insert(tok.address), "duplicate address for {}", tok.symbol);
+        }
+    }
+
+    // ---- (b/e) universe + pool caps ----
+    #[test]
+    fn cap_tokens_keeps_all_bluechips_then_fills_longtail() {
+        let bc0 = TokenInfo { symbol: "B0", address: addr("0x0000000000000000000000000000000000000d01"), decimals: 18, blue_chip: true };
+        let bc1 = TokenInfo { symbol: "B1", address: addr("0x0000000000000000000000000000000000000d02"), decimals: 18, blue_chip: true };
+        let l0 = TokenInfo { symbol: "L0", address: addr("0x0000000000000000000000000000000000000d03"), decimals: 18, blue_chip: false };
+        let l1 = TokenInfo { symbol: "L1", address: addr("0x0000000000000000000000000000000000000d04"), decimals: 18, blue_chip: false };
+        let l2 = TokenInfo { symbol: "L2", address: addr("0x0000000000000000000000000000000000000d05"), decimals: 18, blue_chip: false };
+        let registry = vec![bc0, bc1, l0, l1, l2];
+        // cap = 3 -> both blue-chips + the FIRST long-tail (registry order).
+        let capped = cap_tokens(&registry, 3);
+        assert_eq!(capped.len(), 3);
+        assert_eq!(capped.iter().filter(|t| t.blue_chip).count(), 2);
+        assert_eq!(capped[2].symbol, "L0");
+        // cap larger than the set -> everything.
+        assert_eq!(cap_tokens(&registry, 100).len(), 5);
+        // cap smaller than the blue-chip count -> blue-chips are STILL all kept.
+        let tiny = cap_tokens(&registry, 1);
+        assert_eq!(tiny.len(), 2, "must never drop a blue-chip");
+        assert!(tiny.iter().all(|t| t.blue_chip));
+    }
+
+    #[test]
+    fn cap_tokens_on_real_registry_preserves_bluechips() {
+        let capped = cap_tokens(&arbitrum_tokens(), 15);
+        assert_eq!(capped.len(), 15);
+        assert_eq!(capped.iter().filter(|t| t.blue_chip).count(), 11);
+    }
+
+    #[test]
+    fn cap_by_depth_keeps_deepest_stable_order() {
+        let items = vec![("a", 10.0), ("b", 50.0), ("c", 30.0), ("d", 50.0)];
+        let kept = cap_by_depth(items, 2);
+        // Descending by depth; ties (b,d both 50) keep input order (b before d).
+        assert_eq!(kept, vec![("b", 50.0), ("d", 50.0)]);
+        // max >= len returns all (still sorted desc).
+        let all = cap_by_depth(vec![("x", 1.0), ("y", 2.0)], 9);
+        assert_eq!(all, vec![("y", 2.0), ("x", 1.0)]);
+    }
+
+    // ---- (e) throttle-vs-gate discovery telemetry ----
+    #[test]
+    fn telemetry_honest_zero_is_not_throttle_suspected() {
+        // Every probe/state call succeeded; a small edge set here is HONEST: the
+        // universe shrank only via real gates (decimals/liquidity/etc.), so a
+        // reviewer must NOT read it as a throttle collapse.
+        let t = DiscoveryTelemetry {
+            block: 100,
+            registry_tokens: 43,
+            tokens_loaded: 43,
+            bluechip_loaded: 11,
+            longtail_loaded: 32,
+            tokens_dropped_no_decimals: 0,
+            tokens_dropped_denylist: 0,
+            discovery_probes: 3600,
+            discovery_probes_failed: 0,
+            pools_discovered: 300,
+            state_calls: 1000,
+            state_calls_failed: 0,
+            pools_dropped_incomplete_state: 0,
+            pools_dropped_bad_price: 2,
+            pools_dropped_nonstandard: 4,
+            pools_dropped_liquidity: 250,
+            pools_unpriced_leg: 40,
+            pools_capped: 0,
+            pools_kept: 44,
+            edges_loaded: 88,
+        };
+        assert!(!t.throttle_suspected(), "clean batches must not be flagged as throttle");
+        assert_eq!(t.throttle_drops(), 0);
+        // gate_drops = no_decimals(0)+denylist(0)+bad_price(2)+nonstandard(4)+liquidity(250).
+        assert_eq!(t.gate_drops(), 256);
+        assert_eq!(t.discovery_fail_pct(), 0.0);
+        assert_eq!(t.state_fail_pct(), 0.0);
+    }
+
+    #[test]
+    fn telemetry_flags_throttle_on_failed_discovery_probes() {
+        // 10% of discovery probes failed (> THROTTLE_WARN_PCT 5%): a shrunken
+        // universe here is a THROTTLE artifact and must be flagged as such, even
+        // though it stays under the hard MAX_BATCH_FAILURE_FRACTION abort bar.
+        let t = DiscoveryTelemetry {
+            discovery_probes: 1000,
+            discovery_probes_failed: 100,
+            state_calls: 500,
+            state_calls_failed: 0,
+            pools_discovered: 50,
+            ..Default::default()
+        };
+        assert!(t.discovery_fail_pct() > THROTTLE_WARN_PCT);
+        assert!(t.throttle_suspected(), "high discovery failure must flag throttle");
+        assert_eq!(t.throttle_drops(), 100);
+    }
+
+    #[test]
+    fn telemetry_flags_throttle_on_incomplete_state_reads() {
+        // Batches "passed" but a large share of discovered pools lost a required
+        // state read (missing balanceOf/liquidity) — a partial-graph throttle
+        // symptom that must be flagged, not silently treated as honest zero.
+        let t = DiscoveryTelemetry {
+            discovery_probes: 1000,
+            discovery_probes_failed: 0,
+            state_calls: 400,
+            state_calls_failed: 0,
+            pools_discovered: 100,
+            pools_dropped_incomplete_state: 20, // 20% of discovered pools
+            ..Default::default()
+        };
+        assert_eq!(t.discovery_fail_pct(), 0.0);
+        assert_eq!(t.state_fail_pct(), 0.0);
+        assert!(t.incomplete_state_pct() > THROTTLE_WARN_PCT);
+        assert!(t.throttle_suspected(), "high incomplete-state rate must flag throttle");
+        assert_eq!(t.throttle_drops(), 20);
+    }
+
+    #[test]
+    fn telemetry_percentages_are_zero_safe() {
+        // An all-empty snapshot must not divide by zero.
+        let t = DiscoveryTelemetry::default();
+        assert_eq!(t.discovery_fail_pct(), 0.0);
+        assert_eq!(t.state_fail_pct(), 0.0);
+        assert_eq!(t.incomplete_state_pct(), 0.0);
+        assert!(!t.throttle_suspected());
+        assert_eq!(t.throttle_drops(), 0);
+        assert_eq!(t.gate_drops(), 0);
     }
 }

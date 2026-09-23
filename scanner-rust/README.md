@@ -24,17 +24,25 @@ cargo run
 
 - **Venues / fee tiers:** Uniswap V3 (500 / 3000 / 10000 ppm) and SushiSwap
   (UniswapV2-style, 3000 ppm), pools discovered via factory `getPool`/`getPair`.
-- **Tokens:** WETH, USDC (native), USDC.e, USDT, ARB, WBTC, GMX, PENDLE, MAGIC,
-  RDNT, DAI (canonical, verified Arbitrum addresses).
+- **Tokens:** an on-chain-verified registry of the 11 curated **blue-chips**
+  (WETH, USDC native, USDC.e, USDT, ARB, WBTC, GMX, PENDLE, MAGIC, RDNT, DAI) plus
+  a **Phase 9 long-tail set** of cross-verified mid/small-cap Arbitrum tokens (see
+  *Phase 9* below). Every long-tail address was taken from ≥2 reputable token
+  lists — never guessed.
 - **Prices:** Uniswap V3 from `slot0().sqrtPriceX96`
   (`(sqrt/2^96)^2 * 10^(dec0-dec1)`); V2 from `getReserves()`
   (`reserve1/reserve0 * 10^(dec0-dec1)`). Both directions are emitted with the
   correct per-direction price and the pool's fee.
-- **Decimals:** USDC/USDC.e/USDT = 6, WBTC = 8, others = 18. A wrong decimal
+- **Decimals:** read **on-chain** via ERC20 `decimals()` for every token. The 11
+  blue-chips keep their verified constants (USDC/USDC.e/USDT = 6, WBTC = 8, others
+  = 18) as a resilient fallback + cross-check; a long-tail token whose `decimals()`
+  cannot be read is **dropped** (fail-closed — never assumed). A wrong decimal
   factor manufactures fake spreads, so implausible prices are logged and skipped.
-- **Liquidity guard:** on-chain `balanceOf` reserves are valued in USD (stables
-  anchored at $1, other tokens derived from the observed graph) and pools below
-  `SCANNER_MIN_POOL_LIQUIDITY_USD` (default $5000) are skipped as dust.
+- **Liquidity guard:** on-chain `balanceOf` reserves are valued in USD (see the
+  consensus USD anchor in *Phase 9*) and pools below their floor are dropped as
+  dust — `SCANNER_MIN_POOL_LIQUIDITY_USD` (default $5,000) for blue-chip-only
+  pools, and the higher `SCANNER_MIN_LONGTAIL_POOL_LIQUIDITY_USD` (default
+  $25,000) for any pool touching a long-tail token.
 - **RPC resilience:** batched `eth_call`s, a request timeout, retries with
   backoff, and modest sequential chunking for rate-limited free tiers.
 
@@ -100,6 +108,55 @@ simulated and either **survive** or are honestly `rejected_negative`;
 `rejected_unsimulable` is reserved for truly unknowable states. Zero surviving
 opportunities remains a valid, truthful outcome.
 
+### Long-tail token/pool universe expansion (Phase 9)
+The blue-chip-only universe (~110 edges) never surfaces a survivor — those pairs
+are the most-arbitraged on Arbitrum, so real price impact erases every spot
+spread. Phase 9 **expands the universe toward the long tail** where persistent
+inefficiency can live, feeding a bigger but *still rigorously-gated* edge set into
+the **unchanged** Bellman-Ford + net-profit + sim-gate + payload pipeline. It adds
+**no new venue** (still Uniswap V3 + SushiSwap V2) and does **not** touch
+`executor.rs`. Every gate is fail-closed — expansion only *adds* candidates that
+pass honest checks; a gate is never loosened to manufacture a survivor, and zero
+survivors is still a valid outcome.
+
+- **(a) Honest discovery + on-chain decimals.** Discovery is a **vetted registry
+  expansion**: each long-tail address is a real Arbitrum token cross-verified
+  across ≥2 reputable lists (never guessed), and every token's `decimals()` is read
+  **on-chain**. A long-tail token with unreadable decimals is dropped; blue-chips
+  fall back to their verified constant so a throttled batch can never drop a core
+  anchor.
+- **(b) Liquidity filtering + caps.** Two-tier USD liquidity floor (blue-chip
+  $5,000 / long-tail $25,000) plus hard caps `SCANNER_MAX_TOKENS` (default 64) and
+  `SCANNER_MAX_POOLS` (default 400, keep the **deepest** by USD) bound the graph
+  and RPC. Everything below floor or over cap is dropped.
+- **(c) Consensus + depth USD anchoring.** A long-tail token's USD price is the
+  **deepest venue among quotes that agree**: gather every implied USD price (one
+  per pool routing the token to an already-priced token), require
+  `SCANNER_MIN_ANCHOR_VENUES` (default 2) quotes within `SCANNER_ANCHOR_OUTLIER_PCT`
+  (default 3%) of their median, then pick the deepest survivor. A token that cannot
+  clear this bar is left **un-priced** → its pools fail the USD liquidity gate and
+  are dropped (never valued on a guess). Stablecoins stay anchored at $1.
+- **(d) Non-standard token safety.** Fee-on-transfer / rebasing tokens break the
+  constant-product / V3 output math. A V2 **reserves-vs-`balanceOf` divergence
+  check** (tolerance `SCANNER_V2_BALANCE_TOLERANCE_PCT`, default 1%) flags a token
+  whose live balance is materially below its stored reserve and **drops it from all
+  its pools** (including V3); a documented denylist is the extension point for known
+  bad tokens; and the consensus/depth gate itself rejects most scam/thin tokens.
+  When in doubt, exclude.
+- **(e) Bounded RPC.** The new `decimals()` reads and the enlarged discovery/state
+  batches all flow through the existing batched `eth_call` + fail-closed
+  `MAX_BATCH_FAILURE_FRACTION` guard; cross-tick data is fetched only for pools that
+  survive the gate + cap. Any degraded/partial batch drops the affected candidate,
+  never fabricates state. Each fetch returns a `DiscoveryTelemetry` **throttle-vs-gate
+  proof** — probes attempted vs failed, pools dropped for *incomplete state* (RPC
+  throttle) vs *honest gates* (decimals/denylist/bad-price/non-standard/liquidity),
+  and `throttle_suspected()` (flags when a batch failure rate exceeds
+  `THROTTLE_WARN_PCT`) — so a small/zero edge set can be told apart from a silent
+  throttle collapse. The capstone prints it per block.
+- **(f) Preserved behavior.** All 11 blue-chips stay in with unchanged
+  addresses/decimals; V3 (incl. Phase 8 cross-tick) + Sushi V2 math is unchanged;
+  the detection/sim/payload pipeline is reused as-is on the bigger edge set.
+
 ### Run the capstone dry run
 The capstone example samples the whole pipeline across several live blocks, then
 always runs a clearly-labeled **synthetic fixture** pass (works with no RPC):
@@ -115,6 +172,10 @@ Sampling and economics are env-tunable:
 - `SCANNER_LIVE_SAMPLE_DELAY_SECS` (default 5) — delay between samples.
 - `SCANNER_SIM_LOAN_SIZES_USD`, `SCANNER_SIM_GAS_USD_PER_HOP`,
   `SCANNER_DRYRUN_SLIPPAGE_BPS` — loan sweep, per-hop gas, slippage guard.
+- **Phase 9 universe knobs:** `SCANNER_MAX_TOKENS`, `SCANNER_MAX_POOLS`,
+  `SCANNER_MIN_LONGTAIL_POOL_LIQUIDITY_USD`, `SCANNER_MIN_ANCHOR_VENUES`,
+  `SCANNER_ANCHOR_OUTLIER_PCT`, `SCANNER_V2_BALANCE_TOLERANCE_PCT` (see
+  `.env.example`).
 
 **ZERO surviving cycles is a valid, expected, honest outcome** — spot spreads on
 liquid Arbitrum pairs are mirages that price impact erases. The pipeline never
