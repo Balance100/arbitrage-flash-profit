@@ -4,6 +4,7 @@ pub mod flashlight;
 pub mod payload;
 pub mod pipeline;
 pub mod pools;
+pub mod replay;
 pub mod scanner;
 pub mod sim;
 pub mod simulator;
