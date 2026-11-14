@@ -146,6 +146,9 @@ export function runTsAdapter(fixturePath: string = FIXTURE_PATH) {
   if (fixture.edges.length < MIN_HOPS || fixture.edges.length > MAX_HOPS) {
     throw new Error(`replay fixture hop count ${fixture.edges.length} outside [${MIN_HOPS},${MAX_HOPS}]`);
   }
+  if (fixture.edges.some((edge) => edge.isV3)) {
+    throw new Error('replay fixture contains V3 edges, which are unsupported by the V2 replay simulator');
+  }
 
   const trace = simulateLoop(fixture);
   const network = fixture.network;

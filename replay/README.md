@@ -35,12 +35,13 @@ production data path.
    fixture always match exactly.
 5. A **fail-closed pairing validator + manifest generator**
    (`scripts/replay/manifest.mjs`) that verifies both envelopes are a genuine,
-   untampered pair and performs a **shadow comparison** of the overlapping
-   economics the two adapters can agree on: hop count, profitability sign, and
-   economic **magnitude** (best loan size, realized ratio, net profit USD,
-   within documented tolerances — see "Shadow comparison / handoff" below). It
-   writes `replay/out/manifest.json` **only on success**; any pairing or
-   magnitude-comparison failure exits non-zero and writes nothing.
+   untampered pair by verifying each `sourceHash` and `runId` against the raw
+   fixture bytes named by its `fixturePath`, and performs a **shadow comparison**
+   of the overlapping economics the two adapters can agree on: hop count,
+   profitability sign, and economic **magnitude** (best loan size, realized
+   ratio, net profit USD, within documented tolerances — see "Shadow comparison /
+   handoff" below). It writes `replay/out/manifest.json` **only on success**; any
+   pairing or magnitude-comparison failure exits non-zero and writes nothing.
 
 ## Hash derivation (why TS and Rust match exactly)
 
@@ -192,6 +193,8 @@ cargo test --manifest-path scanner-rust/Cargo.toml --test replay_tests  # Rust: 
   executable-payload-grade numbers — the magnitude comparison verifies the TS
   estimate stays within tolerance of that source of truth, it does not make
   the TS number authoritative.
+- The TS replay adapter rejects fixtures containing V3 edges because its replay
+  simulator only implements V2 constant-product math.
 - The shadow comparison now checks hop count, profitability sign, AND
   economic magnitude (best loan size, realized ratio, net profit USD), and now
   covers the small, focused route-length/fee-tier fixture matrix above

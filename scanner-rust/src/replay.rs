@@ -21,6 +21,7 @@ use ethers::types::{Address, U256};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::payload::{MAX_HOPS, MIN_HOPS};
 use crate::pipeline::{run_sample, PipelineParams, SampleReport};
 use crate::types::{PoolEdge, PoolSwapState};
 
@@ -242,6 +243,12 @@ pub fn run_rust_adapter_with_fixture(repo_root: &Path, fixture_rel_path: &str) -
 
     let fixture: Fixture = serde_json::from_slice(&raw)
         .unwrap_or_else(|e| panic!("replay fixture at {} failed to parse: {e}", path.display()));
+    if !(MIN_HOPS..=MAX_HOPS).contains(&fixture.edges.len()) {
+        panic!(
+            "replay fixture hop count {} outside [{MIN_HOPS},{MAX_HOPS}]",
+            fixture.edges.len()
+        );
+    }
 
     let edges = edges_from_fixture(&fixture);
     let usd_prices = usd_prices_from_fixture(&fixture);

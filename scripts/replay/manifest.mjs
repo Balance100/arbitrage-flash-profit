@@ -21,11 +21,11 @@
 //
 // Run: node scripts/replay/manifest.mjs
 
-import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, realpathSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { sha256Hex } from './lib/hash.mjs';
+import { sha256Hex, deriveRunId } from './lib/hash.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -105,6 +105,52 @@ function loadEnvelope(filePath, checks) {
     });
   }
   return { envelope, bytesHash: sha256Hex(raw) };
+}
+
+function verifyFixture(envelope, envelopePath, checks) {
+  const label = path.basename(envelopePath);
+  const fixturePath = envelope.fixturePath;
+  if (typeof fixturePath !== 'string' || !fixturePath || path.isAbsolute(fixturePath)) {
+    checks.push({ ok: false, check: `${label}: fixturePath is a repository-relative path` });
+    return;
+  }
+
+  const resolvedPath = path.resolve(REPO_ROOT, fixturePath);
+  const relativePath = path.relative(REPO_ROOT, resolvedPath);
+  if (relativePath === '..' || relativePath.startsWith(`..${path.sep}`) || path.isAbsolute(relativePath)) {
+    checks.push({ ok: false, check: `${label}: fixturePath stays within the repository` });
+    return;
+  }
+
+  let fixtureBytes;
+  try {
+    const rootRealPath = realpathSync(REPO_ROOT);
+    const fixtureRealPath = realpathSync(resolvedPath);
+    const realRelativePath = path.relative(rootRealPath, fixtureRealPath);
+    if (
+      realRelativePath === '..' ||
+      realRelativePath.startsWith(`..${path.sep}`) ||
+      path.isAbsolute(realRelativePath)
+    ) {
+      checks.push({ ok: false, check: `${label}: fixturePath resolves within the repository` });
+      return;
+    }
+    fixtureBytes = readFileSync(fixtureRealPath);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    checks.push({ ok: false, check: `${label}: fixture can be read (${message})` });
+    return;
+  }
+
+  const fixtureHash = sha256Hex(fixtureBytes);
+  checks.push({
+    ok: envelope.sourceHash === fixtureHash,
+    check: `${label}: sourceHash matches fixture bytes (${envelope.sourceHash} === ${fixtureHash})`,
+  });
+  checks.push({
+    ok: envelope.runId === deriveRunId(fixtureHash),
+    check: `${label}: runId is derived from fixture bytes (${envelope.runId} === ${deriveRunId(fixtureHash)})`,
+  });
 }
 
 /** Fail-closed pairing validation + shadow comparison. Pure function (no I/O
@@ -245,6 +291,9 @@ export function generateManifestForPaths(tsEnvelopePath, rsEnvelopePath) {
   const checks = [];
   const ts = loadEnvelope(tsEnvelopePath, checks);
   const rs = loadEnvelope(rsEnvelopePath, checks);
+
+  if (ts) verifyFixture(ts.envelope, tsEnvelopePath, checks);
+  if (rs) verifyFixture(rs.envelope, rsEnvelopePath, checks);
 
   const validation = validatePairing(ts?.envelope, rs?.envelope);
   const allChecks = [...checks, ...validation.checks];
