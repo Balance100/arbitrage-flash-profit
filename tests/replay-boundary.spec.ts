@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { expect, test } from '@playwright/test';
 
 import { sha256Hex, deriveRunId } from '../scripts/replay/lib/hash.mjs';
-import { validatePairing } from '../scripts/replay/manifest.mjs';
+import { generateManifestForPaths, validatePairing } from '../scripts/replay/manifest.mjs';
 import { FIXTURE_MATRIX, runMatrix } from '../scripts/replay/matrix.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -155,6 +155,48 @@ test.describe('replay boundary: fail-closed pairing validator', () => {
     expect(
       result.checks.some((c) => !c.ok && c.check.includes('comparable economic magnitude fields')),
     ).toBe(true);
+  });
+});
+
+test.describe('replay boundary: manifest validates fixture evidence', () => {
+  test('rejects envelopes with synchronized hashes that do not match the referenced fixture', () => {
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'replay-manifest-fixture-'));
+    const tsPath = path.join(tmpDir, 'ts-envelope.json');
+    const rsPath = path.join(tmpDir, 'rs-envelope.json');
+    const fixturePath = 'replay/fixtures/replay-input-v1.json';
+    const fixtureHash = sha256Hex(readFileSync(path.join(REPO_ROOT, fixturePath)));
+    const expectedRunId = deriveRunId(fixtureHash);
+    const ts = baseEnvelope('ts');
+    const rs = baseEnvelope('rust');
+    for (const envelope of [ts, rs]) {
+      envelope.fixturePath = fixturePath;
+      envelope.sourceHash = fixtureHash;
+      envelope.inputHash = fixtureHash;
+      envelope.runId = expectedRunId;
+    }
+
+    try {
+      writeFileSync(tsPath, JSON.stringify(ts), 'utf8');
+      writeFileSync(rsPath, JSON.stringify(rs), 'utf8');
+      expect(generateManifestForPaths(tsPath, rsPath).pass).toBe(true);
+
+      const tamperedHash = sha256Hex('tampered fixture bytes');
+      ts.sourceHash = tamperedHash;
+      rs.sourceHash = tamperedHash;
+      ts.inputHash = tamperedHash;
+      rs.inputHash = tamperedHash;
+      ts.runId = deriveRunId(tamperedHash);
+      rs.runId = deriveRunId(tamperedHash);
+      writeFileSync(tsPath, JSON.stringify(ts), 'utf8');
+      writeFileSync(rsPath, JSON.stringify(rs), 'utf8');
+
+      const manifest = generateManifestForPaths(tsPath, rsPath);
+      expect(manifest.pass).toBe(false);
+      expect(manifest.checks.some((check) => !check.ok && check.check === 'TS sourceHash matches fixture bytes')).toBe(true);
+      expect(manifest.checks.some((check) => !check.ok && check.check === 'Rust runId matches fixture bytes')).toBe(true);
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
