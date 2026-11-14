@@ -25,7 +25,7 @@ import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
-import { sha256Hex } from './lib/hash.mjs';
+import { deriveRunId, sha256Hex } from './lib/hash.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -105,6 +105,42 @@ function loadEnvelope(filePath, checks) {
     });
   }
   return { envelope, bytesHash: sha256Hex(raw) };
+}
+
+function validateFixtureEvidence(tsEnvelope, rsEnvelope, checks) {
+  const fixturePathMatches =
+    typeof tsEnvelope.fixturePath === 'string' &&
+    tsEnvelope.fixturePath.length > 0 &&
+    tsEnvelope.fixturePath === rsEnvelope.fixturePath;
+  checks.push({ ok: fixturePathMatches, check: 'fixturePath matches between envelopes' });
+  if (!fixturePathMatches) return;
+
+  const fixtureAbsolutePath = path.resolve(REPO_ROOT, tsEnvelope.fixturePath);
+  const fixtureRelativePath = path.relative(REPO_ROOT, fixtureAbsolutePath);
+  const fixtureIsInRepository =
+    fixtureRelativePath !== '..' &&
+    !fixtureRelativePath.startsWith(`..${path.sep}`) &&
+    !path.isAbsolute(fixtureRelativePath);
+  checks.push({ ok: fixtureIsInRepository, check: 'fixturePath resolves within the repository' });
+  if (!fixtureIsInRepository) return;
+
+  let fixtureBytes;
+  try {
+    fixtureBytes = readFileSync(fixtureAbsolutePath);
+  } catch (e) {
+    checks.push({
+      ok: false,
+      check: `fixture exists and is readable: ${tsEnvelope.fixturePath} (${e.message})`,
+    });
+    return;
+  }
+
+  const fixtureHash = sha256Hex(fixtureBytes);
+  const fixtureRunId = deriveRunId(fixtureHash);
+  checks.push({ ok: tsEnvelope.sourceHash === fixtureHash, check: 'TS sourceHash matches fixture bytes' });
+  checks.push({ ok: rsEnvelope.sourceHash === fixtureHash, check: 'Rust sourceHash matches fixture bytes' });
+  checks.push({ ok: tsEnvelope.runId === fixtureRunId, check: 'TS runId matches fixture bytes' });
+  checks.push({ ok: rsEnvelope.runId === fixtureRunId, check: 'Rust runId matches fixture bytes' });
 }
 
 /** Fail-closed pairing validation + shadow comparison. Pure function (no I/O
@@ -245,6 +281,10 @@ export function generateManifestForPaths(tsEnvelopePath, rsEnvelopePath) {
   const checks = [];
   const ts = loadEnvelope(tsEnvelopePath, checks);
   const rs = loadEnvelope(rsEnvelopePath, checks);
+
+  if (ts && rs) {
+    validateFixtureEvidence(ts.envelope, rs.envelope, checks);
+  }
 
   const validation = validatePairing(ts?.envelope, rs?.envelope);
   const allChecks = [...checks, ...validation.checks];
