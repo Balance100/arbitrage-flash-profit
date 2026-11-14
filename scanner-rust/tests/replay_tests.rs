@@ -8,6 +8,7 @@
 //! loop is a genuine (detectable AND sim-positive) survivor via the EXISTING
 //! `pipeline::run_sample` engine — no reimplemented swap math here.
 
+use mev_scanner::payload::{MAX_HOPS, MIN_HOPS};
 use mev_scanner::replay::{
     default_repo_root, derive_run_id, run_rust_adapter, run_rust_adapter_with_fixture, sha256_hex,
 };
@@ -101,4 +102,42 @@ fn fixture_matrix_covers_min_hops_through_max_hops_and_is_deterministic() {
         assert!(a.result.survivors[0].realized_ratio > 1.0, "{fixture_rel_path}");
         assert!(a.result.survivors[0].realized_net_usd > 0.0, "{fixture_rel_path}");
     }
+}
+
+#[test]
+fn rust_adapter_rejects_fixture_hop_counts_outside_contract_bounds() {
+    let temp_root =
+        std::env::temp_dir().join(format!("replay-invalid-hops-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_root).unwrap();
+    let fixture_path = temp_root.join("invalid-hops.json");
+    let repo_root = temp_root.as_path();
+    let fixture_rel_path = "invalid-hops.json";
+    let baseline_path = default_repo_root().join("replay/fixtures/replay-input-v1.json");
+    let baseline: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(baseline_path).unwrap()).unwrap();
+
+    for edge_count in [MIN_HOPS - 1, MAX_HOPS + 1] {
+        let mut fixture = baseline.clone();
+        let edges = fixture["edges"].as_array_mut().unwrap();
+        let first_edge = edges[0].clone();
+        let retained_edges = edge_count.min(edges.len());
+        edges.truncate(retained_edges);
+        while edges.len() < edge_count {
+            edges.push(first_edge.clone());
+        }
+        std::fs::write(&fixture_path, serde_json::to_vec(&fixture).unwrap()).unwrap();
+
+        let result = std::panic::catch_unwind(|| {
+            run_rust_adapter_with_fixture(repo_root, fixture_rel_path);
+        });
+        let panic = result.expect_err(&format!("fixture with {edge_count} edges must be rejected"));
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        assert!(message.contains("outside [2,5]"), "{message}");
+    }
+
+    std::fs::remove_dir_all(temp_root).unwrap();
 }

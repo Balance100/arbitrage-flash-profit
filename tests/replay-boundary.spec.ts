@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { expect, test } from '@playwright/test';
 
 import { sha256Hex, deriveRunId } from '../scripts/replay/lib/hash.mjs';
-import { validatePairing } from '../scripts/replay/manifest.mjs';
+import { generateManifestForPaths, validatePairing } from '../scripts/replay/manifest.mjs';
 import { FIXTURE_MATRIX, runMatrix } from '../scripts/replay/matrix.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -156,15 +156,51 @@ test.describe('replay boundary: fail-closed pairing validator', () => {
       result.checks.some((c) => !c.ok && c.check.includes('comparable economic magnitude fields')),
     ).toBe(true);
   });
+
+  test('manifest rejects envelopes whose matching hashes do not match the referenced fixture bytes', () => {
+    const fixtureRelativePath = 'replay/fixtures/replay-input-v1.json';
+    const alteredSourceHash = sha256Hex('altered fixture bytes');
+    const fixtureHash = sha256Hex(readFileSync(path.join(REPO_ROOT, fixtureRelativePath)));
+    expect(alteredSourceHash).not.toBe(fixtureHash);
+    const ts = baseEnvelope('ts');
+    const rs = baseEnvelope('rust');
+    for (const envelope of [ts, rs]) {
+      envelope.fixturePath = fixtureRelativePath;
+      envelope.sourceHash = alteredSourceHash;
+      envelope.inputHash = alteredSourceHash;
+      envelope.runId = deriveRunId(alteredSourceHash);
+    }
+
+    const tmpDir = mkdtempSync(path.join(tmpdir(), 'replay-manifest-integrity-'));
+    const tsPath = path.join(tmpDir, 'ts-envelope.json');
+    const rsPath = path.join(tmpDir, 'rs-envelope.json');
+    try {
+      writeFileSync(tsPath, JSON.stringify(ts), 'utf8');
+      writeFileSync(rsPath, JSON.stringify(rs), 'utf8');
+      const manifest = generateManifestForPaths(tsPath, rsPath);
+      expect(manifest.comparison.economicsMatch).toBe(true);
+      expect(manifest.pass).toBe(false);
+      expect(
+        manifest.checks.filter((c) => !c.ok).some((c) => c.check.includes('sourceHash matches fixture bytes')),
+      ).toBe(true);
+      expect(manifest.checks.filter((c) => !c.ok).some((c) => c.check.includes('runId is derived from fixture bytes'))).toBe(
+        true,
+      );
+    } finally {
+      rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 test.describe('replay boundary: manifest CLI removes stale PASS manifests on failure', () => {
   test('a prior PASS manifest.json is deleted, not left stale, when a subsequent run fails closed', () => {
+    test.setTimeout(180_000); // `replay:all` may compile the Rust adapter on a clean checkout
     const outDir = path.join(REPO_ROOT, 'replay', 'out');
     const rsPath = path.join(outDir, 'rs-envelope.json');
     const manifestPath = path.join(outDir, 'manifest.json');
     const manifestScript = path.join(REPO_ROOT, 'scripts', 'replay', 'manifest.mjs');
 
+    execFileSync('npm', ['run', 'replay:all'], { cwd: REPO_ROOT, stdio: 'pipe' });
     const originalRs = readFileSync(rsPath, 'utf8');
     try {
       // Establish a known-good PASS manifest first.
@@ -232,6 +268,34 @@ test.describe('replay boundary: end-to-end TS adapter run', () => {
       expect(result.status).toBe('active');
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  test('rejects V3 fixtures before applying V2 swap math', () => {
+    const fixturePath = path.join(tmpdir(), `replay-v3-fixture-${process.pid}.json`);
+    const adapterUrl = pathToFileURL(path.join(REPO_ROOT, 'scripts/replay/ts-adapter.ts')).href;
+    const scriptPath = path.join(tmpdir(), `replay-v3-run-${process.pid}.mjs`);
+    const fixture = JSON.parse(readFileSync(path.join(REPO_ROOT, 'replay/fixtures/replay-input-v1.json'), 'utf8'));
+    fixture.edges[0].isV3 = true;
+    writeFileSync(fixturePath, JSON.stringify(fixture), 'utf8');
+    writeFileSync(
+      scriptPath,
+      `const mod = await import('${adapterUrl}');\nmod.runTsAdapter(${JSON.stringify(fixturePath)});\n`,
+      'utf8',
+    );
+
+    try {
+      let error;
+      try {
+        execFileSync('node', ['--experimental-strip-types', scriptPath], { cwd: REPO_ROOT, stdio: 'pipe' });
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeTruthy();
+      expect(error.stderr.toString()).toContain('unsupported by the V2 replay simulator');
+    } finally {
+      rmSync(fixturePath, { force: true });
+      rmSync(scriptPath, { force: true });
     }
   });
 });
